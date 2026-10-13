@@ -43,8 +43,9 @@
 
 速度（默认 12 米/秒）和加速倍率可在菜单「穿墙飞天」里调整。REFramework 菜单打开时不会移动，避免在输入框打字时乱飞。
 
-- ⚠️ **落地后再关闭**。在空中关闭会立刻恢复重力，高处会摔伤甚至摔死。
-- 飞行中角色可能保持跳跃/下落动作，属正常现象。
+- 飞行中游戏自身的移动 / 跳跃 / 攻击输入会被屏蔽，镜头（鼠标）不受影响。
+- **防摔伤**：飞行中持续重置摔落高度；关闭后默认再保护 10 秒，空中关闭也能安全落地（可在菜单关掉）。
+- 飞行中角色可能保持跳跃 / 下落动作，属正常现象。
 - 读档、死亡、切换角色后会自动关闭。
 - 飞到地图边界外或地形内部关闭，可能卡在模型里；重新开启飞出来即可。
 
@@ -73,7 +74,7 @@
 | 提示「未进入游戏或找不到玩家」 | 需在读档进入游戏世界后使用，标题画面无效 |
 | 提示「无效物品ID」 | 该 ID 在当前版本不存在，请先导出清单查找 |
 | 飞天状态显示「未找到碰撞组件」 | 能飞但可能无法穿墙；把日志里 `fly on` 那行发 issue |
-| 开启后角色被拉回原地 / 抖动 | 游戏有其他系统在写位置；把日志和现象发 issue |
+| 只有镜头在动，模型不动 / 状态显示「位置被游戏拉回」 | `Character.warp` 不可用（游戏更新），日志里会有对应行，请发 issue |
 | 飞天自动关闭并提示「出错」 | 查看日志里 `fly error:` 那行 |
 
 ## 实现说明
@@ -81,7 +82,7 @@
 - 物品数据：`app.ItemManager.getItemData(System.Int32)`，扫描 ID 0–70000，每帧 3000 个，避免卡顿。
 - 添加物品：优先 `getItem(System.Int32, System.Int32, app.Character)`，回退到带 `app.ItemDefine.GetItemOption` 的重载。
 - 名称：从物品数据中找到名称 GUID 字段，通过 `via.gui.message.get(System.Guid)` 取本地化文本。
-- 穿墙飞天：关闭玩家 GameObject 上的 `via.physics.CharacterController`（碰撞 + 重力），在 `LateUpdateBehavior` 按相机矩阵（RE 引擎相机朝 −Z）计算位移并 `set_Position`，`BeginRendering` 前再锁一次位置覆盖根运动。单帧被外部移动 >30 m 视为传送 / 原点偏移，跟随而不拉回。关闭时恢复组件原状态并调用 `warp()` 同步物理胶囊。
+- 穿墙飞天：DD2 的角色有位置历史（PosRotContext），直接 `set_Position` 只会移动镜头、模型会被拉回。所以在 `app.UserInputManager.updateInput` 之后（玩家输入处理时）调用游戏自带的 `app.Character.warp(via.vec3, via.Quaternion, app.CharacterWarpOption.ResetPosRotContext)`；同时关闭 `<CharaController>`（碰撞 + 重力），清空玩家输入的按键 / 左摇杆，并每帧重置 `<FallInfo>` 防摔伤。输入钩子失效时退回 `UpdateBehavior` 执行；`warp` 不可用时退回 `set_Position` 并在状态栏报警。单帧被外部移动 >30 m 视为游戏传送，跟随而不拉回。
 - 所有游戏方法调用都在游戏线程（`UpdateBehavior` / `LateUpdateBehavior`）中执行，并用 `pcall` 包裹；UI 线程只写请求标志。
 
 ## 测试
@@ -92,12 +93,13 @@
 lua tests/mock_test.lua reframework/autorun/DD2_ItemSpawner.lua
 ```
 
-覆盖：开关边沿触发、六方向移动与速度、Shift 加速、斜向归一化、镜头朝向、帧时间上限、抵抗重力漂移、传送跟随、碰撞组件保持关闭与恢复、菜单打开时不移动、玩家对象变化自动关闭、异常不崩溃，以及刷物品功能回归。
+模拟器还原了 DD2 的位置历史（直接改 Transform 会被拉回）、动作阶段取模型位置、重力与摔伤、游戏自身的走路 / 跳跃输入。覆盖：模型跟随（v1 的「只动镜头」bug 在此复现）、开关边沿触发、六方向移动与速度、Shift 加速、斜向归一化、镜头朝向、帧时间上限、抵抗重力漂移、传送跟随、碰撞组件保持关闭与恢复、游戏输入屏蔽与恢复、防摔伤开 / 关对比、菜单打开时不移动、warp / 输入钩子不可用时的兜底、玩家对象变化自动关闭、异常不崩溃，以及刷物品功能回归。
 
 ## 致谢
 
 - [praydog/REFramework](https://github.com/praydog/REFramework)
 - [Zharay/DD2-LUAModFixes](https://github.com/Zharay/DD2-LUAModFixes) —— Dark Arisen 后的 `getItem` 签名参考
+- [ntgoten/dimension-door](https://github.com/ntgoten/dimension-door) —— DD2 正确移动角色的方式（`Character.warp` + `ResetPosRotContext`、输入时机、`FallInfo`）
 - [alphazolam/EMV-Engine](https://github.com/alphazolam/EMV-Engine) —— RE 引擎 CharacterController / 相机矩阵用法参考
 
 ## License

@@ -192,9 +192,14 @@ re.on_application_entry("UpdateBehavior", function()
 end)
 
 -- ============================================================
--- 穿墙飞天（noclip fly）
--- 原理：关闭玩家的 via.physics.CharacterController（碰撞 + 重力），
---       每帧按镜头方向自行计算并写入玩家位置。关闭时恢复组件并 warp 同步。
+-- 穿墙飞天（noclip fly）v2
+-- DD2 的角色有位置历史（PosRotContext），直接改 Transform 只会移动镜头、
+-- 模型会被拉回原处。所以这里：
+--   1) 关闭角色的 CharacterController（碰撞 + 重力）
+--   2) 在游戏读取玩家输入时（app.UserInputManager.updateInput 之后），
+--      用游戏自带的 app.Character.warp(位置, 旋转, ResetPosRotContext) 移动角色
+--   3) 同时清空游戏的移动/按键输入，避免角色跟着走路、跳跃、攻击
+--   4) 每帧重置 FallInfo（摔落高度），关闭后继续保护数秒，防摔伤
 -- ============================================================
 local VK = {
     TOGGLE = { 0x75 },             -- F6
@@ -203,17 +208,24 @@ local VK = {
     DOWN = { 0x11, 0xA2, 0xA3 },   -- Ctrl / LCtrl / RCtrl
     FAST = { 0x10, 0xA0, 0xA1 },   -- Shift / LShift / RShift
 }
+local BTN_FIELDS = { "ButtonOnFlags", "ButtonTriggerFlags", "ButtonReleaseFlags", "ButtonRepeatFlags" }
+local WARP_SIG = "warp(via.vec3, via.Quaternion, app.CharacterWarpOption)"
+local CC_TYPE = "via.physics.CharacterController"
+local REBASE_JUMP = 30.0   -- 单帧被外部移动超过此距离：视为游戏传送，跟随
+
 local fly = {
     enabled   = false,
-    request   = nil,    -- UI 线程只写请求，游戏线程执行
+    request   = nil,    -- UI / 热键只写请求，游戏线程执行
     speed     = 12.0,   -- 米/秒
     fastMult  = 4.0,
+    safeLand  = true,   -- 关闭后防摔伤
+    safeLandSec = 10.0,
     status    = "关闭",
-    player    = nil, xform = nil, cc = nil, ccWasEnabled = nil,
-    target    = nil, lastWritten = nil, lastClock = nil, togglePrev = false,
+    player = nil, xform = nil, cc = nil, ccWasEnabled = nil,
+    target = nil, lastWritten = nil, lastActual = nil, lastClock = nil,
+    togglePrev = false, fallUntil = nil, revertWarned = false,
+    useWarp = true, hookOk = false, lastTickClock = nil,
 }
-local CC_TYPE = "via.physics.CharacterController"
-local REBASE_JUMP = 30.0  -- 单帧被外部移动超过此距离视为传送/原点偏移，跟随而不是拉回
 
 local function keyDown(list)
     for _, k in ipairs(list) do
@@ -230,45 +242,102 @@ local function addrOf(obj)
     return tostring(obj)
 end
 
-local function getCC(player)
-    local ok, cc = pcall(function()
-        return player:get_GameObject():call("getComponent(System.Type)", sdk.typeof(CC_TYPE))
-    end)
-    if ok then return cc end
+local function field(obj, name)
+    local ok, v = pcall(function() return obj[name] end)
+    if ok then return v end
     return nil
 end
 
-local function restoreCC(cc, wasEnabled)
-    if not cc then return end
-    pcall(cc.call, cc, "set_Enabled", wasEnabled ~= false)
-    pcall(cc.call, cc, "warp")  -- 把物理胶囊同步到当前 Transform，防止被拉回原处
+local function xformOf(pl)
+    local tr = field(pl, "<Transform>k__BackingField")
+    if tr then return tr end
+    local ok, t = pcall(function() return pl:get_GameObject():get_Transform() end)
+    return ok and t or nil
+end
+
+local function getCC(pl)
+    local cc = field(pl, "<CharaController>k__BackingField")
+    if cc then return cc end
+    local ok, c = pcall(function()
+        return pl:get_GameObject():call("getComponent(System.Type)", sdk.typeof(CC_TYPE))
+    end)
+    return ok and c or nil
+end
+
+local warpOptCache
+local function warpOpt()
+    if warpOptCache == nil then
+        local ok, v = pcall(function()
+            return sdk.find_type_definition("app.CharacterWarpOption"):get_field("ResetPosRotContext"):get_data(nil)
+        end)
+        warpOptCache = ok and v or false
+    end
+    return warpOptCache or nil
+end
+
+-- 用游戏自己的 warp 移动角色（同时重置位置历史）；不可用时退回 set_Position
+local function placeAt(pl, xf, pos)
+    if fly.useWarp then
+        local opt = warpOpt()
+        local ok = opt ~= nil and pcall(function()
+            pl:call(WARP_SIG, pos, xf:get_Rotation(), opt)
+        end)
+        if ok then return true end
+        fly.useWarp = false
+        log_("Character.warp 不可用，改用 set_Position（模型可能不跟随）")
+    end
+    pcall(xf.set_Position, xf, pos)
+    if fly.cc then pcall(fly.cc.call, fly.cc, "warp") end
+    return false
+end
+
+local function resetFall(pl, xf)
+    pcall(function()
+        local up = xf:get_UniversalPosition()
+        local fi = pl["<FallInfo>k__BackingField"]
+        fi:call("resetBaseHeight(via.Position)", up)
+        fi:call("set_HighestPositionOnAir(via.Position)", up)
+        fi:call("resetFallHeight()")
+    end)
 end
 
 local function flyOn()
     local pl = getPlayer()
     if not pl then fly.status = "开启失败：未进入游戏"; return end
-    local ok, xf = pcall(function() return pl:get_GameObject():get_Transform() end)
-    if not ok or not xf then fly.status = "开启失败：找不到玩家 Transform"; return end
+    local xf = xformOf(pl)
+    if not xf then fly.status = "开启失败：找不到玩家 Transform"; return end
+    local ok, pos = pcall(xf.get_Position, xf)
+    if not ok or not pos then fly.status = "开启失败：读取位置出错"; return end
     fly.player, fly.xform = pl, xf
-    fly.target = xf:get_Position()
-    fly.lastWritten = fly.target
+    fly.target, fly.lastWritten, fly.lastActual = pos, pos, pos
     fly.cc = getCC(pl)
     if fly.cc then
         local ok2, en = pcall(fly.cc.call, fly.cc, "get_Enabled")
         fly.ccWasEnabled = (not ok2) or en
         pcall(fly.cc.call, fly.cc, "set_Enabled", false)
     end
+    fly.useWarp, fly.revertWarned = true, false
     fly.lastClock = os.clock()
+    fly.fallUntil = nil
     fly.enabled = true
     fly.status = fly.cc and "开启" or "开启（未找到碰撞组件，可能无法穿墙）"
-    log_("fly on, cc=" .. tostring(fly.cc ~= nil))
+    log_("fly on, cc=" .. tostring(fly.cc ~= nil) .. " warpOpt=" .. tostring(warpOpt() ~= nil)
+        .. " inputHook=" .. tostring(fly.hookOk))
 end
 
 local function flyOff(reason)
-    restoreCC(fly.cc, fly.ccWasEnabled)
+    local pl, xf = fly.player, fly.xform
+    if pl and xf and fly.target then pcall(placeAt, pl, xf, fly.target) end  -- 原地落定，同步历史
+    if fly.cc then
+        pcall(fly.cc.call, fly.cc, "set_Enabled", fly.ccWasEnabled ~= false)
+        pcall(fly.cc.call, fly.cc, "warp")
+    end
+    if fly.safeLand and pl then
+        fly.fallUntil = { player = pl, xform = xf, t = os.clock() + fly.safeLandSec }
+    end
     fly.enabled = false
     fly.player, fly.xform, fly.cc, fly.ccWasEnabled = nil, nil, nil, nil
-    fly.target, fly.lastWritten = nil, nil
+    fly.target, fly.lastWritten, fly.lastActual = nil, nil, nil
     fly.status = reason or "关闭"
     log_("fly off: " .. fly.status)
 end
@@ -289,31 +358,36 @@ local function flyMoveDir()
     return dir:normalized()
 end
 
-local function flyTick()
-    -- 开关：F6 边沿触发 + UI 请求
-    local t = keyDown(VK.TOGGLE)
-    if t and not fly.togglePrev then fly.request = not fly.enabled end
-    fly.togglePrev = t
-    if fly.request ~= nil then
-        local want = fly.request
-        fly.request = nil
-        if want and not fly.enabled then flyOn() elseif not want and fly.enabled then flyOff() end
-    end
-    if not fly.enabled then return end
+local function uiIsOpen()
+    local ok, v = pcall(function() return reframework:is_drawing_ui() end)
+    return ok and v or false
+end
 
-    -- 读档 / 死亡 / 换人后玩家对象变化 → 自动关闭
-    local pl = getPlayer()
-    if not pl or addrOf(pl) ~= addrOf(fly.player) then flyOff("已自动关闭（玩家对象变化）"); return end
+-- 每帧移动：优先在玩家输入处理完之后执行（inp = 玩家的输入对象，可为 nil）
+local function flyTick(inp)
+    if not fly.enabled then return end
+    local pl = fly.player
+    local xf = fly.xform
 
     local now = os.clock()
     local dt = math.max(0, math.min(now - (fly.lastClock or now), 0.1))
     fly.lastClock = now
+    fly.lastTickClock = now
 
-    local ok, actual = pcall(fly.xform.get_Position, fly.xform)
-    if not ok or not actual then flyOff("已自动关闭（Transform 失效）"); return end
-    if fly.lastWritten and (actual - fly.lastWritten):length() > REBASE_JUMP then
-        fly.target = fly.target + (actual - fly.lastWritten)  -- 游戏传送/原点偏移，跟随
+    local ok, actual = pcall(xf.get_Position, xf)
+    if not ok or not actual then error("Transform 失效") end
+    local drift = (actual - fly.lastWritten):length()
+    if drift > REBASE_JUMP then
+        if (actual - fly.lastActual):length() > REBASE_JUMP then
+            fly.target = fly.target + (actual - fly.lastWritten)   -- 游戏传送 / 原点偏移，跟随
+        elseif not fly.revertWarned then
+            fly.revertWarned = true
+            fly.status = "警告：位置被游戏拉回（模型可能不跟随），见日志"
+            log_("position reverted by game: actual=" .. tostring(actual.x) .. "," .. tostring(actual.y) .. ","
+                .. tostring(actual.z) .. " useWarp=" .. tostring(fly.useWarp))
+        end
     end
+    fly.lastActual = actual
 
     -- 游戏状态机可能重新打开碰撞，保持关闭
     if fly.cc then
@@ -321,33 +395,84 @@ local function flyTick()
         if ok2 and en then pcall(fly.cc.call, fly.cc, "set_Enabled", false) end
     end
 
-    -- 打开 REFramework 菜单时不移动（避免在输入框打字时乱飞）
-    local uiOpen = false
-    pcall(function() uiOpen = reframework:is_drawing_ui() end)
-    if not uiOpen then
+    -- 菜单打开时不飞（避免打字乱飞）
+    if not uiIsOpen() then
         local dir = flyMoveDir()
         if dir then
             local spd = fly.speed * (keyDown(VK.FAST) and fly.fastMult or 1.0)
             fly.target = fly.target + dir * (spd * dt)
         end
     end
+    -- 飞行期间始终屏蔽游戏自身的移动 / 跳跃 / 攻击输入（镜头输入保留）
+    if inp then
+        for _, f in ipairs(BTN_FIELDS) do pcall(function() inp:set_field(f, 0) end) end
+        pcall(function() inp:call("setAxisL(System.Single, System.Single)", 0.0, 0.0) end)
+    end
 
-    pcall(fly.xform.set_Position, fly.xform, fly.target)
+    placeAt(pl, xf, fly.target)
     fly.lastWritten = fly.target
+    resetFall(pl, xf)
 end
 
-re.on_application_entry("LateUpdateBehavior", function()
-    local ok, err = pcall(flyTick)
+local function safeTick(inp)
+    local ok, err = pcall(flyTick, inp)
     if not ok then
         log_("fly error: " .. tostring(err))
         pcall(flyOff, "已自动关闭（出错，见日志）")
     end
+end
+
+-- 挂到游戏输入更新之后（与 DimensionDoor 同一时机，warp 才能生效）
+pcall(function()
+    local m = sdk.find_type_definition("app.UserInputManager"):get_method("updateInput")
+    if not m then return end
+    local cur
+    sdk.hook(m, function(args)
+        cur = fly.enabled and sdk.to_managed_object(args[3]) or nil
+    end, function(ret)
+        if cur and fly.enabled then
+            local inp = cur
+            cur = nil
+            local okIn, mine = pcall(function() return fly.player:get_Input() end)
+            if okIn and mine and addrOf(mine) == addrOf(inp) then safeTick(inp) end
+        end
+        return ret
+    end)
+    fly.hookOk = true
 end)
 
--- 渲染前再锁一次位置，覆盖动作根运动等后续写入
-re.on_pre_application_entry("BeginRendering", function()
-    if fly.enabled and fly.xform and fly.target then
-        pcall(fly.xform.set_Position, fly.xform, fly.target)
+-- 游戏线程：开关、玩家变化检测、关闭后防摔伤、输入钩子失效时的兜底
+re.on_application_entry("UpdateBehavior", function()
+    local t = keyDown(VK.TOGGLE)
+    if t and not fly.togglePrev then fly.request = not fly.enabled end
+    fly.togglePrev = t
+    if fly.request ~= nil then
+        local want = fly.request
+        fly.request = nil
+        if want and not fly.enabled then pcall(flyOn) elseif not want and fly.enabled then pcall(flyOff) end
+    end
+
+    if fly.enabled then
+        local pl = getPlayer()
+        if not pl or addrOf(pl) ~= addrOf(fly.player) then
+            pcall(flyOff, "已自动关闭（玩家对象变化）")
+        else
+            -- 输入钩子 0.2 秒没触发（版本变化 / 钩子失效）→ 在这里兜底执行
+            local now = os.clock()
+            if not fly.hookOk or not fly.lastTickClock or now - fly.lastTickClock > 0.2 then
+                safeTick(nil)
+            end
+        end
+    end
+
+    local fu = fly.fallUntil
+    if fu then
+        local pl = getPlayer()
+        if os.clock() > fu.t or not pl or addrOf(pl) ~= addrOf(fu.player) then
+            fly.fallUntil = nil
+        else
+            resetFall(fu.player, fu.xform)
+        end
     end
 end)
 
@@ -361,9 +486,10 @@ re.on_draw_ui(function()
         if c then fly.request = v end
         changed, fly.speed = imgui.slider_float("速度 (米/秒)", fly.speed, 1.0, 100.0)
         changed, fly.fastMult = imgui.slider_float("Shift 加速倍率", fly.fastMult, 1.0, 10.0)
+        changed, fly.safeLand = imgui.checkbox("关闭后 10 秒内防摔伤", fly.safeLand)
         imgui.text("状态：" .. fly.status)
         imgui.text("WASD 沿镜头方向  Space 上升  Ctrl 下降  Shift 加速")
-        imgui.text("注意：落地后再关闭，空中关闭会摔伤/摔死；菜单打开时不移动")
+        imgui.text("飞行中游戏自身的移动/跳跃/攻击输入会被屏蔽；菜单打开时不移动")
         imgui.tree_pop()
     end
     imgui.separator()
