@@ -1,9 +1,10 @@
-# DD2 Item Spawner — 龙之信条2 刷物品 + 全物品清单导出
+# DD2 Item Spawner — 龙之信条2 刷物品 + 全物品清单导出 + 穿墙飞天
 
 一个 [REFramework](https://github.com/praydog/REFramework) Lua 脚本，适用于《龙之信条2》（含 Dark Arisen）。
 
 - **导出全物品清单**：直接读取游戏内物品数据库，导出 CSV / JSON，名称为你当前的游戏语言。
 - **刷物品**：按 ID 添加，或按名称搜索后单个 / 批量添加到背包。
+- **穿墙飞天**：F6 开关，沿镜头方向自由飞行，无视碰撞和重力。
 
 > 为什么不附带静态 ID 表？Dark Arisen（2026-10-09）更新后物品和 `getItem` 签名都有变化，网上旧表和旧脚本大量失效。由脚本从游戏里导出，清单永远与当前版本一致。
 
@@ -30,6 +31,23 @@
 
 导出过一次后，清单会在下次启动时自动加载，无需重复扫描。
 
+### 穿墙飞天
+
+| 按键 | 作用 |
+|---|---|
+| **F6** | 开 / 关（菜单里的「启用穿墙飞天」勾选框效果相同） |
+| W / S | 沿镜头方向前进 / 后退（镜头朝上看就往上飞） |
+| A / D | 左 / 右平移 |
+| Space / Ctrl | 垂直上升 / 下降 |
+| Shift | 加速（默认 ×4） |
+
+速度（默认 12 米/秒）和加速倍率可在菜单「穿墙飞天」里调整。REFramework 菜单打开时不会移动，避免在输入框打字时乱飞。
+
+- ⚠️ **落地后再关闭**。在空中关闭会立刻恢复重力，高处会摔伤甚至摔死。
+- 飞行中角色可能保持跳跃/下落动作，属正常现象。
+- 读档、死亡、切换角色后会自动关闭。
+- 飞到地图边界外或地形内部关闭，可能卡在模型里；重新开启飞出来即可。
+
 ## 注意事项
 
 - ⚠️ **先备份存档**。DD2 只有一个主存档：
@@ -38,7 +56,7 @@
 - **注意负重**：一次别刷太多，超重会严重拖慢移动，刷完存进仓库。
 - **名称显示为 `?`**：物品名取自游戏的本地化文本，字段为自动识别；名称为空不影响按 ID 添加。
 - **游戏更新后失效**：先更新 REFramework；仍不行请看下方排错。
-- 仅限单机使用。修改物品属于作弊行为，后果自负。
+- 仅限单机使用。修改物品 / 穿墙属于作弊行为，后果自负。
 
 ## 排错
 
@@ -54,18 +72,33 @@
 | `getItem3=false` 且 `getItem4=false` | 游戏更新改了方法签名，等待 REFramework / 脚本更新 |
 | 提示「未进入游戏或找不到玩家」 | 需在读档进入游戏世界后使用，标题画面无效 |
 | 提示「无效物品ID」 | 该 ID 在当前版本不存在，请先导出清单查找 |
+| 飞天状态显示「未找到碰撞组件」 | 能飞但可能无法穿墙；把日志里 `fly on` 那行发 issue |
+| 开启后角色被拉回原地 / 抖动 | 游戏有其他系统在写位置；把日志和现象发 issue |
+| 飞天自动关闭并提示「出错」 | 查看日志里 `fly error:` 那行 |
 
 ## 实现说明
 
 - 物品数据：`app.ItemManager.getItemData(System.Int32)`，扫描 ID 0–70000，每帧 3000 个，避免卡顿。
 - 添加物品：优先 `getItem(System.Int32, System.Int32, app.Character)`，回退到带 `app.ItemDefine.GetItemOption` 的重载。
 - 名称：从物品数据中找到名称 GUID 字段，通过 `via.gui.message.get(System.Guid)` 取本地化文本。
-- 所有游戏方法调用都在 `UpdateBehavior` 游戏线程中执行，并用 `pcall` 包裹，不在 UI 线程直接调用。
+- 穿墙飞天：关闭玩家 GameObject 上的 `via.physics.CharacterController`（碰撞 + 重力），在 `LateUpdateBehavior` 按相机矩阵（RE 引擎相机朝 −Z）计算位移并 `set_Position`，`BeginRendering` 前再锁一次位置覆盖根运动。单帧被外部移动 >30 m 视为传送 / 原点偏移，跟随而不拉回。关闭时恢复组件原状态并调用 `warp()` 同步物理胶囊。
+- 所有游戏方法调用都在游戏线程（`UpdateBehavior` / `LateUpdateBehavior`）中执行，并用 `pcall` 包裹；UI 线程只写请求标志。
+
+## 测试
+
+`tests/mock_test.lua` 用模拟的 REFramework API 离线测试脚本逻辑（不需要游戏）：
+
+```bash
+lua tests/mock_test.lua reframework/autorun/DD2_ItemSpawner.lua
+```
+
+覆盖：开关边沿触发、六方向移动与速度、Shift 加速、斜向归一化、镜头朝向、帧时间上限、抵抗重力漂移、传送跟随、碰撞组件保持关闭与恢复、菜单打开时不移动、玩家对象变化自动关闭、异常不崩溃，以及刷物品功能回归。
 
 ## 致谢
 
 - [praydog/REFramework](https://github.com/praydog/REFramework)
 - [Zharay/DD2-LUAModFixes](https://github.com/Zharay/DD2-LUAModFixes) —— Dark Arisen 后的 `getItem` 签名参考
+- [alphazolam/EMV-Engine](https://github.com/alphazolam/EMV-Engine) —— RE 引擎 CharacterController / 相机矩阵用法参考
 
 ## License
 
