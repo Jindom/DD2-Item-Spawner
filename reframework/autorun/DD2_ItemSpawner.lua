@@ -1,13 +1,15 @@
 -- ============================================================
--- DD2_ItemSpawner.lua  —  龙之信条2 刷物品 + 全物品清单导出
+-- DD2_ItemSpawner.lua  v1.1.0  —  龙之信条2 全物品清单导出 / 刷物品 / 穿墙飞天
+-- https://github.com/Jindom/DD2-Item-Spawner
 -- 依赖: REFramework (DD2 / Dark Arisen 版本，建议最新 nightly)
 -- 安装: 放到  <游戏目录>\reframework\autorun\
 -- 使用: 游戏内按 Insert 打开 REFramework 菜单 → Script Generated UI → "DD2 刷物品"
 -- 导出: <游戏目录>\reframework\data\DD2_ItemList.csv / .json（名称为当前游戏语言）
--- 穿墙飞天: F6 开关；WASD 沿镜头方向移动，Space 上升，Ctrl 下降，Shift 加速
+-- 穿墙飞天: F6 开关；WASD 沿镜头方向移动，Space 上升，Ctrl 下降，Shift 加速（自带防摔伤）
 -- ============================================================
 
 local MOD = "DD2 刷物品"
+local VERSION = "1.1.0"
 local OUT_CSV  = "DD2_ItemList.csv"
 local OUT_JSON = "DD2_ItemList.json"
 
@@ -530,5 +532,5 @@ re.on_draw_ui(function()
     imgui.tree_pop()
 end)
 
-log_("loaded. getItem3=" .. tostring(getItem3 ~= nil) .. " getItem4=" .. tostring(getItem4 ~= nil)
+log_("loaded v" .. VERSION .. ". getItem3=" .. tostring(getItem3 ~= nil) .. " getItem4=" .. tostring(getItem4 ~= nil)
     .. " msgGet=" .. tostring(msgGet ~= nil))
