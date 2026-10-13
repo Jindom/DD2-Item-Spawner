@@ -15,9 +15,9 @@
 ## 快速开始
 
 1. 安装最新版 **REFramework**（Dark Arisen 建议使用 [nightly 版](https://github.com/praydog/REFramework-nightly/releases)），**只把 `dinput8.dll`** 解压到游戏根目录。
-2. 到 [Releases](https://github.com/Jindom/DD2-Item-Spawner/releases/latest) 下载 `DD2-Item-Spawner-vX.Y.Z.zip`，二选一安装：
-   - **Fluffy Mod Manager**：把 zip 直接拖进 Fluffy，启用即可。
-   - **手动**：把 zip 里的 `reframework/autorun/DD2_ItemSpawner.lua` 复制到 `<游戏目录>\reframework\autorun\`。
+2. 安装脚本，二选一：
+   - **手动**：下载 [`DD2_ItemSpawner.lua`](https://github.com/Jindom/DD2-Item-Spawner/raw/main/reframework/autorun/DD2_ItemSpawner.lua)，放到 `<游戏目录>\reframework\autorun\`。
+   - **Fluffy Mod Manager**：到 [Releases](https://github.com/Jindom/DD2-Item-Spawner/releases) 下载 `DD2-Item-Spawner-vX.Y.Z.zip`，直接拖进 Fluffy 启用。
 3. 启动游戏、读档进入游戏世界，按 **Insert** 打开 REFramework 菜单 → **Script Generated UI** → **DD2 刷物品**。
 
 升级：用新版 `DD2_ItemSpawner.lua` 覆盖旧文件（或在 Fluffy 里替换），已导出的物品清单会保留。
