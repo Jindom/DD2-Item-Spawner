@@ -62,17 +62,18 @@
 
 | 按键 / 按钮 | 作用 |
 |---|---|
-| **F7** / 「秒杀全场（含 BOSS）」 | 把范围内所有存活敌人的 HP 设为 0 |
+| **F7** / 「秒杀全场（含 BOSS）」 | 把范围内所有存活敌人的 HP 设为 0，0.5 秒后仍未死亡的用游戏自带的击杀函数补刀 |
 | **F8** / 「一击必杀模式」勾选框 | 每 0.5 秒把存活敌人的 HP 压到 1，任何一击都会死；对之后刷出的怪、多阶段 BOSS 同样有效 |
 
 | 设置 | 默认 | 说明 |
 |---|---|---|
 | 范围 (米) | 0 | 0 = 所有已加载的敌人；设为 50 只影响 50 米内 |
+| 强制：无视剧情不死保护 | 关 | 剧情 BOSS 可能带有「不死」标记，默认跳过；勾选后强制击杀（可能卡剧情，先存档） |
 
 - 敌人列表来自游戏的 `EnemyManager`，包含 BOSS（龙、美杜莎、独眼巨人等），不包含队友、随从和 NPC。
 - 已死亡的敌人会被跳过，不会把尸体「复活」。
-- 状态栏会显示处理了多少个敌人。
-- **如果 F7 后敌人 HP 归零却没有倒下**：先用 F8 一击必杀模式代替（随便打一下就死），再点「诊断：导出 HP/伤害相关方法」，把 `reframework\data\DD2_HitMethods.txt` 发 issue，以便接入游戏真正的死亡流程。
+- 状态栏会显示：HP 归零即死亡的数量、补刀数量、受剧情不死保护而跳过的数量。
+- **遇到问题**：点「诊断：导出敌人列表与 HP/伤害相关方法」，把 `reframework\data\DD2_HitMethods.txt` 发 issue。文件里包含敌人列表的类型、读取方式，以及每个敌人的 ID、HP、是否死亡 / 不死保护。
 - 不死系敌人在游戏里本身会复活，可能需要火 / 神圣属性补刀。
 - 远处秒杀的敌人是否掉落经验和物品由游戏决定。
 
@@ -94,7 +95,7 @@
 [DD2 刷物品] loaded v1.2.0. getItem3=true getItem4=true msgGet=true
 ```
 
-开启飞天时还会输出 `fly on, cc=true warpOpt=true inputHook=true`，秒杀时输出 `kill all: alive=… zeroed=… inRange=… errors=…`。提 issue 时请附上所有带 `[DD2 刷物品]` 的日志行。
+开启飞天时还会输出 `fly on, cc=true warpOpt=true inputHook=true`，秒杀时输出 `enemy list <类型> count=… via <方式>`、`kill all: zeroed=… inRange=… alreadyDead=… protected=… errors=…` 和 `kill confirm: diedFromHp0=… forced=… failed=…`。同类错误只记录一次。提 issue 时请附上所有带 `[DD2 刷物品]` 的日志行。
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -106,8 +107,9 @@
 | 只有镜头在动，模型不动 / 状态显示「位置被游戏拉回」 | `Character.warp` 不可用（日志里 `warpOpt=false` 或 `Character.warp 不可用`） |
 | 飞天自动关闭并提示「出错」 | 查看日志里 `fly error:` 那行 |
 | 秒杀提示「找不到 EnemyManager」 | 需在读档进入游戏世界后使用 |
-| 秒杀后状态显示「N 个 HP 未变为 0」 | `setHpValue` 对这些敌人无效，用 F8 并导出诊断文件发 issue |
-| 敌人 HP 为 0 但没死 | 用 F8 一击必杀代替，并导出诊断文件发 issue（见上文） |
+| 秒杀提示「敌人列表读取失败」 | 游戏更新改了敌人集合类型，点诊断并发 issue |
+| 状态显示「N 个受剧情不死保护已跳过」 | 剧情 BOSS 的保护标记；需要的话勾选「强制」 |
+| 状态显示「N 个失败」 | 游戏击杀函数对这些敌人无效，点诊断并发 issue |
 
 ## 实现说明
 
@@ -125,10 +127,11 @@
 - 兜底：输入钩子 0.2 秒未触发时改在 `UpdateBehavior` 执行；`warp` 不可用时退回 `set_Position` 并在状态栏报警；单帧被外部移动 >30 m 视为游戏传送（如渡石），跟随而不拉回。
 
 **秒杀全场**
-- 敌人：`app.EnemyManager:getAllEnemies()` → `get_Chara()`；距离用 `Character.get_DistanceSqFromPlayer()`。
-- HP：`Character.get_Hit()` 得到 `app.HitController`，调用 `setHpValue(System.Single, System.Boolean)`；读 `Character.get_Hp()` 跳过已死亡（HP≤0）的敌人。
-- 每个敌人单独 `pcall`，一个出错不影响其他敌人。
-- 诊断按钮用反射列出 `app.HitController` / `app.Character` 中名字含 hp / dead / die / damage / kill 的方法及参数类型。
+- 敌人：`app.EnemyManager:getAllEnemies()`。Dark Arisen 版本的这个集合没有 `get_Item`，因此依次尝试 `get_elements` / `ToArray` / `_items` / `get_Item` / `_entries` 取元素，并在日志里记录成功的方式；元素可以是 `Character` 本身或带 `get_Chara()` 的包装。
+- 击杀：`Character.get_Hit()` 得到 `app.HitController`，调用 `setHpValue(System.Single, System.Boolean)` 把 HP 设为 0；0.5 秒后用 `Character.get_IsDead()` 确认，仍未死亡的调用 `Character.killAndSetDieLoop(app.Character.KillAndSetDieLoopOption)` 补刀。
+- 剧情保护：`HitController.get_IsNoDie()` 为真时默认跳过；勾选强制后先 `set_IsNoDie(false)` / `set_IsAttackNoDie(false)`。
+- 已死亡（`get_IsDead()`）的敌人不处理；每个敌人单独 `pcall`，一个出错不影响其他敌人；同类错误日志只记一次。
+- 诊断在游戏线程执行：反射列出 `HitController` / `Character` 中 HP / 死亡 / 伤害相关方法、`EnemyManager` 全部方法、`KillAndSetDieLoopOption` 的取值，以及敌人列表详情。
 
 **线程**：所有游戏方法调用都在游戏线程（输入钩子 / `UpdateBehavior`）中执行，并用 `pcall` 包裹；UI 线程只写请求标志。
 
@@ -140,10 +143,10 @@
 lua tests/mock_test.lua reframework/autorun/DD2_ItemSpawner.lua
 ```
 
-模拟器还原了 DD2 的位置历史（直接改 Transform 会被拉回）、动作阶段取模型位置、重力与摔伤、游戏自身的走路 / 跳跃输入，以及带血量的敌人（含 BOSS、尸体、远处敌人、出错的敌人），共 88 项检查：
+模拟器还原了 DD2 的位置历史（直接改 Transform 会被拉回）、动作阶段取模型位置、重力与摔伤、游戏自身的走路 / 跳跃输入，以及 Dark Arisen 的敌人集合（没有 `get_Item`，模拟 5 种集合形态）和两种死亡行为（HP 归零即死 / 需要击杀函数），含 BOSS、剧情不死保护、尸体、远处敌人、出错的敌人，共 120 项检查：
 
 - **飞天**：模型跟随（v1.1.0 之前「只动镜头」的 bug 在此复现）、开关边沿触发、六方向移动与速度、Shift 加速、斜向归一化、镜头朝向、帧时间上限、悬停、传送跟随、碰撞组件保持关闭与恢复、游戏输入屏蔽与恢复、防摔伤开 / 关对比、菜单打开时不移动、`warp` / 输入钩子不可用时的兜底、玩家对象变化自动关闭、异常不崩溃。
-- **秒杀全场**：F7 秒杀含远处 BOSS、按键边沿触发、尸体不被复活、单个敌人出错不影响其他、范围过滤、F8 一击必杀（压血、任意一击致死、新刷怪、BOSS 回血 / 换阶段后重新压血、节流、关闭后停止）、勾选框、无 EnemyManager 时不崩溃、诊断导出内容与过滤、飞行中秒杀。
+- **秒杀全场**：v1.2.0「识别不到敌人」的 bug 在此复现；5 种集合形态下秒杀含远处 BOSS、每个敌人只处理一次、尸体不被复活；HP 归零不死时击杀函数补刀；剧情不死保护默认跳过 / 强制击杀；单个敌人出错隔离且日志只记一次；范围过滤；F8 一击必杀（压血、任意一击致死、新刷怪、回血 / 换阶段重新压血、节流、关闭后停止、不碰剧情保护）；集合不可读时不刷屏日志；无 EnemyManager 时不崩溃；诊断内容；飞行中秒杀。
 - **刷物品回归**：清单导出、名称解析、添加物品、飞行中添加物品。
 
 ## 文件结构

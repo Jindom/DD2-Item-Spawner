@@ -117,36 +117,99 @@ local hookAvailable = true
 local mgr = {}
 
 -- ---------- enemies ----------
+-- 模拟 Dark Arisen：敌人集合没有 get_Item；死亡行为可配置
 local HP_SIG = "setHpValue(System.Single, System.Boolean)"
+local KILL_SIG = "killAndSetDieLoop(app.Character.KillAndSetDieLoopOption)"
 local enemies = {}
 local enemyManagerPresent = true
+local listShape = "ToArray"     -- ToArray | _items | _entries | get_elements | get_Item | none
+local hp0Kills = true           -- true: HP 归零即死亡；false: 需要 killAndSetDieLoop
+local function arrayOf(t)
+  return { get_elements = function() local c = {} for i, v in ipairs(t) do c[i] = v end return c end }
+end
 local function newEnemy(name, hp, dist, opts)
   opts = opts or {}
-  local e = { name = name, hp = hp, maxHp = hp, dist = dist, dead = hp <= 0, revived = false, sets = 0, boss = opts.boss, broken = opts.broken }
-  local hit = { call = function(self, sig, v, b)
-    if sig ~= HP_SIG then error("bad sig " .. sig) end
-    if e.broken then error("hit controller broken") end
-    e.sets = e.sets + 1
-    if e.dead and v > 0 then e.revived = true end
-    e.hp = v
-    if v <= 0 then e.dead = true end
-  end }
-  local chara = {
+  local e = { name = name, hp = hp, maxHp = hp, dist = dist, dead = hp <= 0, revived = false, sets = 0, kills = 0,
+              boss = opts.boss, broken = opts.broken, noDie = opts.noDie or false, attackNoDie = opts.noDie or false }
+  local function tryDie()
+    if e.hp <= 0 and not e.noDie and hp0Kills then e.dead = true end
+  end
+  local hit = {
+    call = function(self, sig, v, b)
+      if sig ~= HP_SIG then error("bad sig " .. sig) end
+      if e.broken then error("hit controller broken") end
+      e.sets = e.sets + 1
+      if e.dead and v > 0 then e.revived = true end
+      e.hp = v
+      tryDie()
+    end,
+    get_IsNoDie = function() return e.noDie end,
+    set_IsNoDie = function(self, v) e.noDie = v end,
+    get_IsAttackNoDie = function() return e.attackNoDie end,
+    set_IsAttackNoDie = function(self, v) e.attackNoDie = v end,
+    get_IsDie = function() return e.dead end,
+  }
+  local chara
+  chara = {
     get_Hit = function() return hit end,
     get_Hp = function() return e.hp end,
+    get_IsDead = function() return e.dead end,
     get_DistanceSqFromPlayer = function() return e.dist * e.dist end,
+    get_type_definition = function() return { get_full_name = function() return "app.Character" end } end,
+    call = function(self, sig, ...)
+      if sig == KILL_SIG then
+        local opt = ...
+        assert(opt ~= nil, "option missing")
+        if e.broken then error("broken") end
+        if e.noDie then return end            -- 剧情保护时游戏函数也杀不死
+        e.kills = e.kills + 1; e.hp = 0; e.dead = true
+        return
+      end
+      local g = chara[sig]; if g then return g(chara) end
+      if sig == "get_CharaIDString" then return name end
+      if sig == "get_OriginalMaxHp" then return e.maxHp end
+      error("no method " .. sig)
+    end,
   }
-  e.obj = { get_Chara = function() return chara end }
+  e.obj = { get_Chara = function() return chara end,
+            get_type_definition = function() return { get_full_name = function() return "app.EnemyCharacter" end } end }
+  e.chara = chara
   return e
 end
 local function enemyList()
-  return { get_Count = function() return #enemies end, get_Item = function(self, i) return enemies[i + 1].obj end }
+  local objs = {}
+  for i, en in ipairs(enemies) do objs[i] = en.obj end
+  local col = {
+    get_Count = function() return #objs end,
+    get_type_definition = function() return { get_full_name = function() return "System.Collections.Generic.List`1<app.EnemyCharacter>(" .. listShape .. ")" end } end,
+    get_field = function(self, f)
+      if listShape == "_items" and f == "_items" then
+        local padded = {} for i, v in ipairs(objs) do padded[i] = v end
+        padded[#padded + 1] = objs[1]      -- capacity > count: extra slots must be ignored
+        return arrayOf(padded)
+      end
+      if listShape == "_entries" and f == "_entries" then
+        local ent = {}
+        for i, v in ipairs(objs) do ent[i] = { get_field = function(_, k) if k == "Value" then return v end end } end
+        return arrayOf(ent)
+      end
+      return nil
+    end,
+    call = function(self, sig, i)
+      if sig == "get_Item" and listShape == "get_Item" then return objs[i + 1] end
+      error("method not found: " .. sig)
+    end,
+  }
+  if listShape == "ToArray" then col.ToArray = function() return arrayOf(objs) end end
+  if listShape == "get_elements" then col.get_elements = function() local c = {} for i, v in ipairs(objs) do c[i] = v end return c end end
+  return col
 end
 -- player attack: any positive damage
-local function hitEnemy(e, dmg) if e.dead then return end e.hp = e.hp - dmg; if e.hp <= 0 then e.hp = 0; e.dead = true end end
+local function hitEnemy(e, dmg) if e.dead then return end e.hp = math.max(0, e.hp - dmg); if e.hp <= 0 and not e.noDie then e.dead = true end end
 local typeMethods = {
-  ["app.HitController"] = { "setHpValue|System.Single,System.Boolean", "get_Hp|", "damage|app.HitController.DamageInfo", "update|", "get_IsDead|" },
-  ["app.Character"] = { "get_Hp|", "get_OriginalMaxHp|", "warp|via.vec3,via.Quaternion,app.CharacterWarpOption", "onDie|" },
+  ["app.HitController"] = { "setHpValue|System.Single,System.Boolean", "get_Hp|", "get_IsNoDie|", "set_IsNoDie|System.Boolean", "get_IsDie|", "update|" },
+  ["app.Character"] = { "get_Hp|", "get_IsDead|", "warp|via.vec3,via.Quaternion,app.CharacterWarpOption", "killAndSetDieLoop|app.Character.KillAndSetDieLoopOption" },
+  ["app.EnemyManager"] = { "getAllEnemies|", "get_EnemyCount|" },
 }
 local function typeDef(n)
   return {
@@ -164,9 +227,17 @@ local function typeDef(n)
     end,
   }
 end
+local killOptType = {
+  get_parent_type = function() return { get_full_name = function() return "System.Enum" end } end,
+  is_value_type = function() return true end,
+  get_fields = function() return {
+    { get_name = function() return "None" end, is_static = function() return true end, get_data = function() return 0 end },
+    { get_name = function() return "NoDrop" end, is_static = function() return true end, get_data = function() return 1 end } } end,
+}
 sdk = {
   find_type_definition = function(n)
     if typeMethods[n] then return typeDef(n) end
+    if n == "app.Character.KillAndSetDieLoopOption" then return killOptType end
     if n == "app.CharacterWarpOption" then
       return { get_field = function(_, f) return { get_data = function() return f == "ResetPosRotContext" and RESET_OPT or nil end } end }
     end
@@ -192,7 +263,8 @@ sdk = {
   to_managed_object = function(x) return x end,
 }
 ValueType = { new = function() return {} end }
-log = { info = function(s) io.write("      log: ", s, "\n") end }
+local logLines = {}
+log = { info = function(s) table.insert(logLines, s); io.write("      log: ", s, "\n") end }
 json = { load_file = function() return nil end, dump_file = function() end }
 
 local cb = { post = {}, pre = {} }
@@ -431,55 +503,96 @@ local function killStatus()
   return ""
 end
 local function E(name) for _, e in ipairs(enemies) do if e.name == name then return e end end end
+local function pressF7() keys[0x76] = true; frame(); frame(); keys[0x76] = nil; frame(); end
+local function settle() for i = 1, 8 do frame() end drawUI() end       -- > confirmDelay (0.5s)
+local function countLog(pat) local n = 0 for _, l in ipairs(logLines) do if l:find(pat) then n = n + 1 end end return n end
 currentPlayer = newPlayer(0x8000); P = currentPlayer; frame()
-enemies = {
-  newEnemy("goblin", 300, 10), newEnemy("wolf", 150, 40),
-  newEnemy("dragon", 90000, 120, { boss = true }), newEnemy("medusa", 40000, 300, { boss = true }),
-  newEnemy("corpse", 0, 5), newEnemy("broken", 500, 20, { broken = true }), newEnemy("lich", 20000, 900, { boss = true }),
-}
--- K1 F7 kills all alive incl. bosses, any distance (range 0)
-keys[0x76] = true; frame(); frame(); keys[0x76] = nil; frame(); drawUI()
-check("F7 kills goblin", E("goblin").dead and E("goblin").hp == 0)
-check("F7 kills wolf", E("wolf").dead)
-check("F7 kills boss dragon", E("dragon").dead, E("dragon").hp)
-check("F7 kills boss medusa (300m)", E("medusa").dead)
-check("F7 kills far boss lich (900m)", E("lich").dead)
-check("F7 is edge-triggered (one pass while held)", E("goblin").sets == 1, E("goblin").sets)
-check("corpse untouched (no revive)", E("corpse").sets == 0 and not E("corpse").revived)
-check("one broken enemy doesn't stop others", E("lich").dead and not E("broken").dead)
-check("status reports count + error", killStatus():find("5 个存活敌人") and killStatus():find("1 个出错"), killStatus())
 
--- K2 range filter
+-- K0 the real in-game bug: collection without get_Item (and no other accessor) → clear failure, no spam
+listShape = "none"
+enemies = { newEnemy("goblin", 300, 10) }
+logLines = {}
+pressF7(); pressF7(); pressF7(); drawUI()
+check("unreadable list: no crash + clear status", killStatus():find("敌人列表读取失败") ~= nil, killStatus())
+check("unreadable list: failure logged once", countLog("unreadable") == 1, countLog("unreadable"))
+
+-- K1 every collection shape works (Dark Arisen list has no get_Item)
+for _, shape in ipairs({ "ToArray", "_items", "_entries", "get_elements", "get_Item" }) do
+  listShape = shape
+  enemies = { newEnemy("goblin", 300, 10), newEnemy("dragon", 90000, 900, { boss = true }), newEnemy("corpse", 0, 5) }
+  pressF7(); settle()
+  check("[" .. shape .. "] goblin killed", E("goblin").dead)
+  check("[" .. shape .. "] far boss dragon killed", E("dragon").dead)
+  check("[" .. shape .. "] each enemy processed once", E("goblin").sets == 1 and E("dragon").sets == 1, E("goblin").sets)
+  check("[" .. shape .. "] corpse untouched", E("corpse").sets == 0 and not E("corpse").revived)
+end
+listShape = "ToArray"
+
+-- K2 HP 0 doesn't kill → killAndSetDieLoop finishes them after confirm delay
+hp0Kills = false
+enemies = { newEnemy("ogre", 5000, 20), newEnemy("griffin", 40000, 60, { boss = true }) }
+pressF7(); drawUI()
+check("hp0-alive: HP zeroed first", E("ogre").hp == 0 and not E("ogre").dead)
+check("hp0-alive: status says confirming", killStatus():find("确认中") ~= nil, killStatus())
+settle()
+check("hp0-alive: ogre finished by killAndSetDieLoop", E("ogre").dead and E("ogre").kills == 1)
+check("hp0-alive: boss finished by killAndSetDieLoop", E("griffin").dead and E("griffin").kills == 1)
+check("hp0-alive: status reports forced kills", killStatus():find("2 个用游戏击杀函数补刀") ~= nil, killStatus())
+hp0Kills = true
+enemies = { newEnemy("rat", 50, 5) }
+pressF7(); settle()
+check("hp0-kills: no extra killAndSetDieLoop", E("rat").dead and E("rat").kills == 0)
+check("hp0-kills: status reports HP-0 deaths", killStatus():find("1 个 HP 归零即死亡") ~= nil, killStatus())
+
+-- K3 story no-die protection: skipped by default, forced with checkbox
+enemies = { newEnemy("scripted_boss", 80000, 30, { boss = true, noDie = true }), newEnemy("minion", 200, 10) }
+pressF7(); settle()
+check("no-die boss skipped by default", not E("scripted_boss").dead and E("scripted_boss").hp == 80000)
+check("minion still killed", E("minion").dead)
+pressF7(); drawUI()
+check("status mentions protected count", killStatus():find("1 个受剧情不死保护") ~= nil, killStatus())
+ui.checkbox["强制：无视剧情不死保护（可能卡剧情，先存档）"] = true; drawUI()
+pressF7(); settle()
+check("forced: no-die boss killed", E("scripted_boss").dead and not E("scripted_boss").noDie)
+ui.checkbox["强制：无视剧情不死保护（可能卡剧情，先存档）"] = false; drawUI()
+
+-- K4 broken enemy isolated, logged once
+enemies = { newEnemy("ok1", 300, 10), newEnemy("broken", 500, 20, { broken = true }), newEnemy("ok2", 300, 30) }
+logLines = {}
+pressF7(); settle(); pressF7(); settle()
+check("broken enemy doesn't stop others", E("ok1").dead and E("ok2").dead and not E("broken").dead)
+check("same error logged once", countLog("enemy #%d error") == 1, countLog("enemy #%d error"))
+
+-- K5 range filter
 enemies = { newEnemy("near", 300, 10), newEnemy("far", 300, 80), newEnemy("farboss", 50000, 200, { boss = true }) }
 imgui.slider_float = function(l, v) if l:find("^范围") then return true, 50.0 end return false, v end
-ui.clicks["秒杀全场（含 BOSS）"] = true; drawUI(); ui.clicks = {}; frame(); drawUI()
-imgui.slider_float = function(_, v) return false, v end
+ui.clicks["秒杀全场（含 BOSS）"] = true; drawUI(); ui.clicks = {}; frame(); settle()
+imgui.slider_float = function(l, v) if l:find("^范围") then return true, 0.0 end return false, v end
+drawUI(); imgui.slider_float = function(_, v) return false, v end
 check("range 50m: near killed", E("near").dead)
 check("range 50m: far spared", not E("far").dead and E("far").sets == 0)
 check("range 50m: far boss spared", not E("farboss").dead)
-imgui.slider_float = function(l, v) if l:find("^范围") then return true, 0.0 end return false, v end
-drawUI(); imgui.slider_float = function(_, v) return false, v end
 
--- K3 one-hit mode (F8): caps alive at 1, skips dead, handles new spawns, one hit kills
-enemies = { newEnemy("orc", 800, 15), newEnemy("cyclops", 30000, 60, { boss = true }), newEnemy("deadguy", 0, 5) }
+-- K6 one-hit mode (F8)
+enemies = { newEnemy("orc", 800, 15), newEnemy("cyclops", 30000, 60, { boss = true }), newEnemy("deadguy", 0, 5),
+            newEnemy("guarded", 9000, 20, { noDie = true }) }
 keys[0x77] = true; frame(); keys[0x77] = nil; frame(); drawUI()
 check("F8 enables one-hit", killStatus():find("一击必杀：开启") ~= nil, killStatus())
 check("one-hit caps orc HP to 1", E("orc").hp == 1 and not E("orc").dead)
 check("one-hit caps boss HP to 1", E("cyclops").hp == 1 and not E("cyclops").dead)
 check("one-hit never revives corpse", E("deadguy").sets == 0 and not E("deadguy").revived)
+check("one-hit skips no-die by default", E("guarded").hp == 9000)
 hitEnemy(E("orc"), 5); hitEnemy(E("cyclops"), 5)
 check("any hit kills capped enemies", E("orc").dead and E("cyclops").dead)
 table.insert(enemies, newEnemy("newspawn", 600, 30))
-for i = 1, 6 do frame() end                                         -- >= 0.5 s
+for i = 1, 6 do frame() end
 check("new spawn gets capped", E("newspawn").hp == 1)
 local setsBefore = E("orc").sets
 for i = 1, 10 do frame() end
 check("dead enemies not touched again", E("orc").sets == setsBefore and not E("orc").revived)
--- boss heals / phase change -> recapped
 E("newspawn").hp = 5000
 for i = 1, 6 do frame() end
 check("healed/phase-2 enemy recapped", E("newspawn").hp == 1)
--- period: not every frame
 local s0 = E("newspawn").sets; E("newspawn").hp = 100; frame(0.1); local s1 = E("newspawn").sets
 check("one-hit pass throttled (≈0.5s)", s1 - s0 <= 1)
 keys[0x77] = true; frame(); keys[0x77] = nil; frame(); drawUI()
@@ -487,12 +600,20 @@ check("F8 disables one-hit", killStatus() == "状态：一击必杀：关闭", k
 E("newspawn").hp = 900; for i = 1, 10 do frame() end
 check("after off, HP no longer capped", E("newspawn").hp == 900)
 
--- K4 UI checkbox for one-hit
+-- K7 UI checkbox for one-hit
 ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = true; drawUI(); frame(); drawUI()
 check("UI checkbox enables one-hit", E("newspawn").hp == 1, E("newspawn").hp)
 ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = false; drawUI(); frame()
 
--- K5 no EnemyManager (title screen)
+-- K8 one-hit with unreadable list: no log spam (the 2100-line bug)
+listShape = "none"; logLines = {}
+ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = true; drawUI()
+for i = 1, 60 do frame() end
+check("one-hit unreadable list logged once (no spam)", countLog("unreadable") <= 1, countLog("unreadable"))
+ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = false; drawUI(); frame()
+listShape = "ToArray"
+
+-- K9 no EnemyManager (title screen)
 enemyManagerPresent = false
 ui.clicks["秒杀全场（含 BOSS）"] = true; drawUI(); ui.clicks = {}
 local okK = pcall(frame); drawUI()
@@ -500,21 +621,27 @@ check("no EnemyManager: no crash", okK)
 check("no EnemyManager: clear status", killStatus():find("EnemyManager") ~= nil, killStatus())
 enemyManagerPresent = true
 
--- K6 diagnostics dump
+-- K10 diagnostics (runs on game thread)
+enemies = { newEnemy("goblin", 300, 10), newEnemy("medusa", 40000, 120, { boss = true, noDie = true }) }
 os.remove("DD2_HitMethods.txt")
-ui.clicks["诊断：导出 HP/伤害相关方法"] = true; drawUI(); ui.clicks = {}; drawUI()
+ui.clicks["诊断：导出敌人列表与 HP/伤害相关方法"] = true; drawUI(); ui.clicks = {}
+check("diag deferred to game thread", io.open("DD2_HitMethods.txt") == nil)
+frame(); drawUI()
 local df = io.open("DD2_HitMethods.txt"); local dump = df and df:read("a") or ""; if df then df:close() end
-check("dump file written", dump ~= "", killStatus())
-check("dump has setHpValue signature", dump:find("setHpValue%(System.Single, System.Boolean%)") ~= nil, dump)
-check("dump has damage(DamageInfo)", dump:find("damage%(app.HitController.DamageInfo%)") ~= nil)
-check("dump has Character death method", dump:find("onDie%(%)") ~= nil)
-check("dump filters unrelated (no warp/update)", not dump:find("warp") and not dump:find("update%("))
+check("diag file written", dump ~= "", killStatus())
+check("diag: HitController methods", dump:find("setHpValue%(System.Single, System.Boolean%)") ~= nil)
+check("diag: killAndSetDieLoop listed", dump:find("killAndSetDieLoop%(app.Character.KillAndSetDieLoopOption%)") ~= nil)
+check("diag: EnemyManager methods (unfiltered)", dump:find("getAllEnemies%(%)") ~= nil and dump:find("get_EnemyCount") ~= nil)
+check("diag: kill option enum fields", dump:find("None = 0") ~= nil and dump:find("parent=System.Enum") ~= nil, dump)
+check("diag: list type + count + via", dump:find("count=2") and dump:find("via=ToArray"), dump)
+check("diag: per-enemy line with id/HP/NoDie", dump:find("CharaIDString=medusa") and dump:find("IsNoDie=true") and dump:find("Hp=40000"), dump)
+check("diag: filters unrelated Character methods", not dump:find("warp%("))
 
--- K7 cross-feature: kill while flying
+-- K11 cross-feature: kill while flying
 enemies = { newEnemy("bandit", 400, 25) }
 fly(true)
 s = P.model; moveFrame({ 0x20 })
-keys[0x76] = true; frame(); keys[0x76] = nil; frame()
+pressF7(); settle()
 check("kill works while flying", E("bandit").dead)
 s = P.model; moveFrame({ 0x20 })
 check("fly still works after kill", approx(P.model.y, s.y + 1.2))

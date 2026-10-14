@@ -480,39 +480,129 @@ re.on_application_entry("UpdateBehavior", function()
 end)
 
 -- ============================================================
--- 秒杀全场（含 BOSS）
--- 枚举 app.EnemyManager:getAllEnemies()，对每个敌人的 HitController 调用
--- setHpValue(System.Single, System.Boolean)。
---   * 秒杀（F7）：HP 设为 0
---   * 一击必杀（F8 开关）：持续把存活敌人的 HP 压到 1，任何一击都会死，
---     对新刷出的怪、多阶段 BOSS 同样有效
--- 已死亡（HP<=0）的敌人一律跳过，避免把尸体“复活”。
+-- 秒杀全场（含 BOSS）v2
+-- 敌人：app.EnemyManager:getAllEnemies()。Dark Arisen 版本的这个集合没有
+--       get_Item，所以 iterItems() 依次尝试多种取元素方式，并记录哪种可用。
+-- 击杀：HitController.setHpValue(0) → 0.5 秒后用 Character.get_IsDead() 确认，
+--       没死则调用游戏自带的 Character.killAndSetDieLoop() 补刀。
+-- 剧情不死保护（HitController.get_IsNoDie()）默认跳过，可在菜单里勾选强制。
+-- 一击必杀（F8）：每 0.5 秒把存活敌人的 HP 压到 1。
+-- 已死亡的敌人一律跳过，避免把尸体“复活”。
 -- ============================================================
 local KILL_VK = { KILL = { 0x76 }, ONEHIT = { 0x77 } }   -- F7 / F8
 local kill = {
     range        = 0,       -- 米；0 = 所有已加载的敌人
     oneHit       = false,
     oneHitPeriod = 0.5,     -- 秒
+    forceNoDie   = false,   -- 无视剧情不死保护
+    confirmDelay = 0.5,     -- 秒：HP 归零后多久确认死亡
     status       = "",
     request      = false,   -- UI 线程只写请求
     oneHitReq    = nil,
+    diagReq      = false,
     killPrev = false, onePrev = false, lastOneHit = nil,
+    pending  = nil,         -- { t = 截止时间, list = { chara... } }
+    enumVia  = nil,         -- 成功的取元素方式（日志 / 诊断用）
+    logged   = {},          -- 同类日志只记一次
 }
-local HP_SIG = "setHpValue(System.Single, System.Boolean)"
+local HP_SIG   = "setHpValue(System.Single, System.Boolean)"
+local KILL_SIG = "killAndSetDieLoop(app.Character.KillAndSetDieLoopOption)"
 
-local function forEachEnemy(fn)
+local function logOnce(key, msg)
+    if kill.logged[key] then return end
+    kill.logged[key] = true
+    log_(msg)
+end
+
+local function typeName(obj)
+    local ok, n = pcall(function() return obj:get_type_definition():get_full_name() end)
+    return ok and n or "?"
+end
+
+-- 取集合里的元素：返回 Lua 数组 + 使用的方式
+local function iterItems(col, count)
+    local tries = {
+        { "get_elements", function()
+            local t = col:get_elements(); assert(type(t) == "table"); return t end },
+        { "ToArray", function()
+            local t = col:ToArray():get_elements(); assert(type(t) == "table"); return t end },
+        { "_items", function()
+            local arr = col:get_field("_items"); assert(arr)
+            local t, all = {}, arr:get_elements()
+            for i = 1, math.min(count, #all) do t[i] = all[i] end
+            return t end },
+        { "get_Item", function()
+            local t = {}
+            for i = 0, count - 1 do t[#t + 1] = col:call("get_Item", i) end
+            return t end },
+        { "_entries", function()
+            local arr = col:get_field("_entries") or col:get_field("_slots"); assert(arr)
+            local t = {}
+            for _, en in ipairs(arr:get_elements()) do
+                local v = en:get_field("Value") or en:get_field("value") or en:get_field("Key")
+                if v then t[#t + 1] = v end
+            end
+            return t end },
+    }
+    local errs = {}
+    for _, tr in ipairs(tries) do
+        local ok, t = pcall(tr[2])
+        if ok and type(t) == "table" and (#t > 0 or count == 0) then return t, tr[1] end
+        errs[#errs + 1] = tr[1] .. ": " .. tostring(ok and "empty" or t)
+    end
+    return nil, table.concat(errs, " | ")
+end
+
+-- 元素可能是 Character 本身，也可能是带 get_Chara() 的包装对象
+local function charaOf(e)
+    local ok, c = pcall(function() return e:get_Chara() end)
+    if ok and c then return c end
+    local ok2, h = pcall(function() return e:get_Hit() end)
+    if ok2 and h then return e end
+    return nil
+end
+
+local function enemyList()
     local em = sdk.get_managed_singleton("app.EnemyManager")
     if not em then return nil, "找不到 EnemyManager（未进入游戏？）" end
-    local ok, list = pcall(function() return em:getAllEnemies() end)
-    if not ok or not list then return nil, "getAllEnemies 失败：" .. tostring(list) end
-    local okC, n = pcall(function() return list:get_Count() end)
-    if not okC then return nil, "读取敌人数量失败" end
+    local ok, col = pcall(function() return em:getAllEnemies() end)
+    if not ok or not col then return nil, "getAllEnemies 失败：" .. tostring(col) end
+    local okC, n = pcall(function() return col:get_Count() end)
+    if not okC then n = 0 end
+    local items, via = iterItems(col, n or 0)
+    if not items then
+        logOnce("enum:" .. via, "enemy list " .. typeName(col) .. " count=" .. tostring(n) .. " unreadable: " .. via)
+        return nil, "敌人列表读取失败（" .. typeName(col) .. "），请点诊断"
+    end
+    if kill.enumVia ~= via then
+        kill.enumVia = via
+        log_("enemy list " .. typeName(col) .. " count=" .. tostring(n) .. " via " .. via)
+    end
+    return items, nil, col
+end
+
+local function isDead(chara)
+    local ok, d = pcall(function() return chara:get_IsDead() end)
+    if ok and d ~= nil then return d end
+    local okH, hp = pcall(function() return chara:get_Hp() end)
+    return okH and type(hp) == "number" and hp <= 0
+end
+
+local function hitOf(chara) return chara:get_Hit() end
+
+local function noDie(hit)
+    local ok, v = pcall(function() return hit:get_IsNoDie() end)
+    return ok and v == true
+end
+
+local function forEachEnemy(fn)
+    local items, err = enemyList()
+    if not items then return nil, err end
     local maxD2 = kill.range > 0 and kill.range * kill.range or nil
     local seen, errs = 0, 0
-    for i = 0, n - 1 do
-        local okE, err = pcall(function()
-            local e = list:get_Item(i)
-            local chara = e and e:get_Chara()
+    for i, e in ipairs(items) do
+        local okE, er = pcall(function()
+            local chara = charaOf(e)
             if not chara then return end
             if maxD2 then
                 local okD, d2 = pcall(function() return chara:get_DistanceSqFromPlayer() end)
@@ -523,78 +613,174 @@ local function forEachEnemy(fn)
         end)
         if not okE then
             errs = errs + 1
-            if errs <= 3 then log_("enemy #" .. i .. " error: " .. tostring(err)) end
+            logOnce("enemyerr:" .. tostring(er), "enemy #" .. i .. " error: " .. tostring(er))
         end
     end
     return seen, nil, errs
 end
 
-local function setHp(chara, v)
-    local hit = chara:get_Hit()
-    hit:call(HP_SIG, v, false)
+local killOptCache
+local function killOpt()
+    if killOptCache ~= nil then return killOptCache end
+    killOptCache = false
+    pcall(function()
+        local td = sdk.find_type_definition("app.Character.KillAndSetDieLoopOption")
+        local parent = td:get_parent_type()
+        if parent and parent:get_full_name() == "System.Enum" then
+            killOptCache = 0
+        elseif td:is_value_type() then
+            killOptCache = ValueType.new(td)
+        else
+            killOptCache = sdk.create_instance("app.Character.KillAndSetDieLoopOption"):add_ref()
+        end
+    end)
+    return killOptCache
 end
 
-local function aliveHp(chara)
-    local ok, hp = pcall(function() return chara:get_Hp() end)
-    if ok and type(hp) == "number" then return hp end
-    return nil
+local function forceKill(chara)
+    local opt = killOpt()
+    if opt == false then error("KillAndSetDieLoopOption 不可用") end
+    chara:call(KILL_SIG, opt)
 end
 
 local function killAll()
-    local killed, after0 = 0, 0
+    local zeroed, protected, already = 0, 0, 0
+    local targets = {}
     local seen, err, errs = forEachEnemy(function(chara)
-        local hp = aliveHp(chara)
-        if hp == nil or hp <= 0 then return end   -- 已死亡 / 读不到 HP：跳过
-        setHp(chara, 0.0)
-        killed = killed + 1
-        local h2 = aliveHp(chara)
-        if h2 ~= nil and h2 <= 0 then after0 = after0 + 1 end
+        if isDead(chara) then already = already + 1; return end
+        local hit = hitOf(chara)
+        if noDie(hit) then
+            if not kill.forceNoDie then protected = protected + 1; return end
+            pcall(function() hit:set_IsNoDie(false) end)
+            pcall(function() hit:set_IsAttackNoDie(false) end)
+        end
+        hit:call(HP_SIG, 0.0, false)
+        zeroed = zeroed + 1
+        targets[#targets + 1] = chara
     end)
     if not seen then kill.status = "失败：" .. err; return end
-    kill.status = string.format("秒杀：%d 个存活敌人 HP 已归零（范围内共 %d 个%s）",
-        killed, seen, errs > 0 and ("，" .. errs .. " 个出错，见日志") or "")
-    if killed > 0 and after0 < killed then
-        kill.status = kill.status .. string.format("；%d 个 HP 未变为 0", killed - after0)
+    kill.pending = #targets > 0 and { t = os.clock() + kill.confirmDelay, list = targets } or nil
+    kill.status = string.format("秒杀：%d 个敌人 HP 已归零，确认中…（范围内 %d 个，已死 %d%s%s）",
+        zeroed, seen, already,
+        protected > 0 and ("，" .. protected .. " 个受剧情不死保护已跳过") or "",
+        errs > 0 and ("，" .. errs .. " 个出错") or "")
+    log_(string.format("kill all: zeroed=%d inRange=%d alreadyDead=%d protected=%d errors=%d via=%s",
+        zeroed, seen, already, protected, errs, tostring(kill.enumVia)))
+end
+
+-- HP 归零 0.5 秒后：仍未死亡的用 killAndSetDieLoop 补刀
+local function confirmKills()
+    local p = kill.pending
+    if not p or os.clock() < p.t then return end
+    kill.pending = nil
+    local dead, forced, failed = 0, 0, 0
+    for _, chara in ipairs(p.list) do
+        if isDead(chara) then
+            dead = dead + 1
+        else
+            local ok, e = pcall(forceKill, chara)
+            if ok then forced = forced + 1 else
+                failed = failed + 1
+                logOnce("forcekill:" .. tostring(e), "killAndSetDieLoop failed: " .. tostring(e))
+            end
+        end
     end
-    log_("kill all: alive=" .. killed .. " zeroed=" .. after0 .. " inRange=" .. seen .. " errors=" .. errs)
+    kill.status = string.format("秒杀完成：%d 个 HP 归零即死亡，%d 个用游戏击杀函数补刀%s",
+        dead, forced, failed > 0 and ("，" .. failed .. " 个失败（见日志）") or "")
+    log_(string.format("kill confirm: diedFromHp0=%d forced=%d failed=%d", dead, forced, failed))
 end
 
 local function oneHitPass()
-    local capped = 0
-    local seen, err, errs = forEachEnemy(function(chara)
-        local hp = aliveHp(chara)
-        if hp == nil or hp <= 1.0 then return end  -- 已死 / 已经 ≤1：不动（不复活尸体）
-        setHp(chara, 1.0)
+    local capped, protected = 0, 0
+    local seen, err = forEachEnemy(function(chara)
+        if isDead(chara) then return end                 -- 不复活尸体
+        local okH, hp = pcall(function() return chara:get_Hp() end)
+        if not okH or type(hp) ~= "number" or hp <= 1.0 then return end
+        local hit = hitOf(chara)
+        if noDie(hit) then
+            if not kill.forceNoDie then protected = protected + 1; return end
+            pcall(function() hit:set_IsNoDie(false) end)
+            pcall(function() hit:set_IsAttackNoDie(false) end)
+        end
+        hit:call(HP_SIG, 1.0, false)
         capped = capped + 1
     end)
     if not seen then kill.status = "一击必杀：" .. err; return end
-    if capped > 0 then log_("one-hit: capped " .. capped .. " / " .. seen) end
-    kill.status = string.format("一击必杀：开启（范围内 %d 个敌人）", seen)
+    kill.status = string.format("一击必杀：开启（范围内 %d 个敌人%s）", seen,
+        protected > 0 and ("，" .. protected .. " 个受剧情不死保护") or "")
 end
 
--- 诊断：把 HitController / Character 里和 HP / 死亡 / 伤害有关的方法写到文件
-local function dumpHitMethods()
-    local out = {}
-    for _, tn in ipairs({ "app.HitController", "app.Character" }) do
-        local td = sdk.find_type_definition(tn)
-        table.insert(out, "== " .. tn .. (td and "" or "（未找到）"))
-        local t = td
-        while t do
-            local okM, ms = pcall(function() return t:get_methods() end)
-            for _, m in ipairs(okM and ms or {}) do
-                local okN, name = pcall(function() return m:get_name() end)
-                if okN and name and (name:lower():find("hp") or name:lower():find("dead") or name:lower():find("die")
-                    or name:lower():find("damage") or name:lower():find("kill")) then
-                    local params = {}
-                    pcall(function()
-                        for _, p in ipairs(m:get_param_types()) do table.insert(params, p:get_full_name()) end
-                    end)
-                    table.insert(out, string.format("%s(%s)", name, table.concat(params, ", ")))
-                end
+-- 诊断：HP / 死亡 / 伤害相关方法 + 敌人列表详情
+local function dumpMethods(out, tn, filter)
+    local td = sdk.find_type_definition(tn)
+    table.insert(out, "== " .. tn .. (td and "" or "（未找到）"))
+    local t = td
+    while t do
+        local okM, ms = pcall(function() return t:get_methods() end)
+        for _, m in ipairs(okM and ms or {}) do
+            local okN, name = pcall(function() return m:get_name() end)
+            if okN and name and (not filter or filter(name:lower())) then
+                local params = {}
+                pcall(function()
+                    for _, pt in ipairs(m:get_param_types()) do table.insert(params, pt:get_full_name()) end
+                end)
+                table.insert(out, string.format("%s(%s)", name, table.concat(params, ", ")))
             end
-            local okP, parent = pcall(function() return t:get_parent_type() end)
-            t = okP and parent or nil
-            if t and t:get_full_name():find("^System%.") then break end
+        end
+        local okP, parent = pcall(function() return t:get_parent_type() end)
+        t = okP and parent or nil
+        if t and t:get_full_name():find("^System%.") then break end
+    end
+end
+
+local function runDiagnostics()
+    local out = {}
+    local hpFilter = function(n)
+        return n:find("hp") or n:find("dead") or n:find("die") or n:find("damage") or n:find("kill")
+    end
+    dumpMethods(out, "app.HitController", hpFilter)
+    dumpMethods(out, "app.Character", hpFilter)
+    dumpMethods(out, "app.EnemyManager", nil)
+    table.insert(out, "== app.Character.KillAndSetDieLoopOption")
+    pcall(function()
+        local td = sdk.find_type_definition("app.Character.KillAndSetDieLoopOption")
+        table.insert(out, "parent=" .. tostring(td:get_parent_type() and td:get_parent_type():get_full_name())
+            .. " valuetype=" .. tostring(td:is_value_type()))
+        for _, f in ipairs(td:get_fields()) do
+            local v = ""
+            pcall(function() if f:is_static() then v = " = " .. tostring(f:get_data(nil)) end end)
+            table.insert(out, "  " .. f:get_name() .. v)
+        end
+    end)
+
+    table.insert(out, "== enemies")
+    local em = sdk.get_managed_singleton("app.EnemyManager")
+    table.insert(out, "EnemyManager=" .. tostring(em ~= nil))
+    if em then
+        local ok, col = pcall(function() return em:getAllEnemies() end)
+        table.insert(out, "getAllEnemies ok=" .. tostring(ok) .. " type=" .. (ok and col and typeName(col) or tostring(col)))
+        if ok and col then
+            local okC, n = pcall(function() return col:get_Count() end)
+            table.insert(out, "count=" .. tostring(okC and n or ("err " .. tostring(n))))
+            local items, via = iterItems(col, okC and n or 0)
+            table.insert(out, "via=" .. tostring(via))
+            for i, e in ipairs(items or {}) do
+                local c = charaOf(e)
+                local info = { "#" .. i, "elem=" .. typeName(e), "chara=" .. (c and typeName(c) or "nil") }
+                if c then
+                    for _, g in ipairs({ "get_CharaIDString", "get_Hp", "get_OriginalMaxHp", "get_IsDead", "get_DistanceSqFromPlayer" }) do
+                        local okG, v = pcall(function() return c:call(g) end)
+                        info[#info + 1] = g:gsub("^get_", "") .. "=" .. (okG and tostring(v) or "ERR")
+                    end
+                    pcall(function()
+                        local h = c:get_Hit()
+                        info[#info + 1] = "IsNoDie=" .. tostring(h:get_IsNoDie())
+                        info[#info + 1] = "IsAttackNoDie=" .. tostring(h:get_IsAttackNoDie())
+                        info[#info + 1] = "IsDie=" .. tostring(h:get_IsDie())
+                    end)
+                end
+                table.insert(out, table.concat(info, "  "))
+            end
         end
     end
     local ok, e = pcall(function()
@@ -602,7 +788,7 @@ local function dumpHitMethods()
         f:write(table.concat(out, "\n"), "\n")
         f:close()
     end)
-    kill.status = ok and string.format("已导出 %d 行 → reframework\\data\\DD2_HitMethods.txt", #out)
+    kill.status = ok and string.format("已导出诊断 %d 行 → reframework\\data\\DD2_HitMethods.txt", #out)
         or ("导出失败：" .. tostring(e))
 end
 
@@ -614,10 +800,19 @@ re.on_application_entry("UpdateBehavior", function()
     if o and not kill.onePrev then kill.oneHitReq = not kill.oneHit end
     kill.onePrev = o
 
+    if kill.diagReq then
+        kill.diagReq = false
+        local ok, e = pcall(runDiagnostics)
+        if not ok then kill.status = "诊断出错：" .. tostring(e) end
+    end
     if kill.request then
         kill.request = false
         local ok, e = pcall(killAll)
         if not ok then kill.status = "出错：" .. tostring(e); log_("kill error: " .. tostring(e)) end
+    end
+    if kill.pending then
+        local ok, e = pcall(confirmKills)
+        if not ok then kill.pending = nil; kill.status = "确认出错：" .. tostring(e); log_("confirm error: " .. tostring(e)) end
     end
     if kill.oneHitReq ~= nil then
         kill.oneHit = kill.oneHitReq
@@ -631,7 +826,10 @@ re.on_application_entry("UpdateBehavior", function()
         if not kill.lastOneHit or now - kill.lastOneHit >= kill.oneHitPeriod then
             kill.lastOneHit = now
             local ok, e = pcall(oneHitPass)
-            if not ok then kill.status = "一击必杀出错：" .. tostring(e); log_("one-hit error: " .. tostring(e)) end
+            if not ok then
+                kill.status = "一击必杀出错：" .. tostring(e)
+                logOnce("onehit:" .. tostring(e), "one-hit error: " .. tostring(e))
+            end
         end
     end
 end)
@@ -658,8 +856,9 @@ re.on_draw_ui(function()
         local c, v = imgui.checkbox("一击必杀模式（持续把敌人 HP 压到 1）", kill.oneHit)
         if c then kill.oneHitReq = v end
         changed, kill.range = imgui.slider_float("范围 (米，0 = 全部已加载)", kill.range, 0.0, 500.0)
+        changed, kill.forceNoDie = imgui.checkbox("强制：无视剧情不死保护（可能卡剧情，先存档）", kill.forceNoDie)
         imgui.text("状态：" .. (kill.status ~= "" and kill.status or "待命"))
-        if imgui.button("诊断：导出 HP/伤害相关方法") then pcall(dumpHitMethods) end
+        if imgui.button("诊断：导出敌人列表与 HP/伤害相关方法") then kill.diagReq = true end
         imgui.text("已死亡的敌人会被跳过；不死系敌人可能需要火/神圣属性补刀")
         imgui.tree_pop()
     end
