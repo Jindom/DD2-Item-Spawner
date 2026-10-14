@@ -115,8 +115,58 @@ end
 local hooks = {}
 local hookAvailable = true
 local mgr = {}
+
+-- ---------- enemies ----------
+local HP_SIG = "setHpValue(System.Single, System.Boolean)"
+local enemies = {}
+local enemyManagerPresent = true
+local function newEnemy(name, hp, dist, opts)
+  opts = opts or {}
+  local e = { name = name, hp = hp, maxHp = hp, dist = dist, dead = hp <= 0, revived = false, sets = 0, boss = opts.boss, broken = opts.broken }
+  local hit = { call = function(self, sig, v, b)
+    if sig ~= HP_SIG then error("bad sig " .. sig) end
+    if e.broken then error("hit controller broken") end
+    e.sets = e.sets + 1
+    if e.dead and v > 0 then e.revived = true end
+    e.hp = v
+    if v <= 0 then e.dead = true end
+  end }
+  local chara = {
+    get_Hit = function() return hit end,
+    get_Hp = function() return e.hp end,
+    get_DistanceSqFromPlayer = function() return e.dist * e.dist end,
+  }
+  e.obj = { get_Chara = function() return chara end }
+  return e
+end
+local function enemyList()
+  return { get_Count = function() return #enemies end, get_Item = function(self, i) return enemies[i + 1].obj end }
+end
+-- player attack: any positive damage
+local function hitEnemy(e, dmg) if e.dead then return end e.hp = e.hp - dmg; if e.hp <= 0 then e.hp = 0; e.dead = true end end
+local typeMethods = {
+  ["app.HitController"] = { "setHpValue|System.Single,System.Boolean", "get_Hp|", "damage|app.HitController.DamageInfo", "update|", "get_IsDead|" },
+  ["app.Character"] = { "get_Hp|", "get_OriginalMaxHp|", "warp|via.vec3,via.Quaternion,app.CharacterWarpOption", "onDie|" },
+}
+local function typeDef(n)
+  return {
+    get_full_name = function() return n end,
+    get_parent_type = function() return nil end,
+    get_methods = function()
+      local out = {}
+      for _, spec in ipairs(typeMethods[n] or {}) do
+        local name, ps = spec:match("^(.-)|(.*)$")
+        local params = {}
+        for p in ps:gmatch("[^,]+") do table.insert(params, { get_full_name = function() return p end }) end
+        table.insert(out, { get_name = function() return name end, get_param_types = function() return params end })
+      end
+      return out
+    end,
+  }
+end
 sdk = {
   find_type_definition = function(n)
+    if typeMethods[n] then return typeDef(n) end
     if n == "app.CharacterWarpOption" then
       return { get_field = function(_, f) return { get_data = function() return f == "ResetPosRotContext" and RESET_OPT or nil end } end }
     end
@@ -131,6 +181,9 @@ sdk = {
   end,
   get_managed_singleton = function(n)
     if n == "app.CharacterManager" then return { call = function() return currentPlayer and currentPlayer.obj end } end
+    if n == "app.EnemyManager" then
+      return enemyManagerPresent and { getAllEnemies = function() return enemyList() end } or nil
+    end
     return mgr
   end,
   get_primary_camera = function() return { get_GameObject = function() return { get_Transform = function() return { get_WorldMatrix = function() return camMatrix() end } end } end } end,
@@ -211,7 +264,7 @@ local function moveFrame(keyList, dt) for _, k in ipairs(keyList) do keys[k] = t
 
 -- ===================== Tests =====================
 check("input hook installed", #hooks == 1)
-check("callbacks registered", cb.post.UpdateBehavior and #cb.post.UpdateBehavior == 2 and cb.ui)
+check("callbacks registered", cb.post.UpdateBehavior and #cb.post.UpdateBehavior == 3 and cb.ui)
 
 -- --- 1. toggle via F6 (edge only)
 frame()
@@ -370,6 +423,102 @@ check("fallback path moves model", approx(P.model.y, s.y + 6), vstr(P.model - s)
 fly(false)
 hookAvailable = true
 loadScript()
+
+-- ===================== Kill all =====================
+local function killStatus()
+  local n = 0
+  for _, t in ipairs(ui.texts) do if t:find("^状态") then n = n + 1; if n == 2 then return t end end end
+  return ""
+end
+local function E(name) for _, e in ipairs(enemies) do if e.name == name then return e end end end
+currentPlayer = newPlayer(0x8000); P = currentPlayer; frame()
+enemies = {
+  newEnemy("goblin", 300, 10), newEnemy("wolf", 150, 40),
+  newEnemy("dragon", 90000, 120, { boss = true }), newEnemy("medusa", 40000, 300, { boss = true }),
+  newEnemy("corpse", 0, 5), newEnemy("broken", 500, 20, { broken = true }), newEnemy("lich", 20000, 900, { boss = true }),
+}
+-- K1 F7 kills all alive incl. bosses, any distance (range 0)
+keys[0x76] = true; frame(); frame(); keys[0x76] = nil; frame(); drawUI()
+check("F7 kills goblin", E("goblin").dead and E("goblin").hp == 0)
+check("F7 kills wolf", E("wolf").dead)
+check("F7 kills boss dragon", E("dragon").dead, E("dragon").hp)
+check("F7 kills boss medusa (300m)", E("medusa").dead)
+check("F7 kills far boss lich (900m)", E("lich").dead)
+check("F7 is edge-triggered (one pass while held)", E("goblin").sets == 1, E("goblin").sets)
+check("corpse untouched (no revive)", E("corpse").sets == 0 and not E("corpse").revived)
+check("one broken enemy doesn't stop others", E("lich").dead and not E("broken").dead)
+check("status reports count + error", killStatus():find("5 个存活敌人") and killStatus():find("1 个出错"), killStatus())
+
+-- K2 range filter
+enemies = { newEnemy("near", 300, 10), newEnemy("far", 300, 80), newEnemy("farboss", 50000, 200, { boss = true }) }
+imgui.slider_float = function(l, v) if l:find("^范围") then return true, 50.0 end return false, v end
+ui.clicks["秒杀全场（含 BOSS）"] = true; drawUI(); ui.clicks = {}; frame(); drawUI()
+imgui.slider_float = function(_, v) return false, v end
+check("range 50m: near killed", E("near").dead)
+check("range 50m: far spared", not E("far").dead and E("far").sets == 0)
+check("range 50m: far boss spared", not E("farboss").dead)
+imgui.slider_float = function(l, v) if l:find("^范围") then return true, 0.0 end return false, v end
+drawUI(); imgui.slider_float = function(_, v) return false, v end
+
+-- K3 one-hit mode (F8): caps alive at 1, skips dead, handles new spawns, one hit kills
+enemies = { newEnemy("orc", 800, 15), newEnemy("cyclops", 30000, 60, { boss = true }), newEnemy("deadguy", 0, 5) }
+keys[0x77] = true; frame(); keys[0x77] = nil; frame(); drawUI()
+check("F8 enables one-hit", killStatus():find("一击必杀：开启") ~= nil, killStatus())
+check("one-hit caps orc HP to 1", E("orc").hp == 1 and not E("orc").dead)
+check("one-hit caps boss HP to 1", E("cyclops").hp == 1 and not E("cyclops").dead)
+check("one-hit never revives corpse", E("deadguy").sets == 0 and not E("deadguy").revived)
+hitEnemy(E("orc"), 5); hitEnemy(E("cyclops"), 5)
+check("any hit kills capped enemies", E("orc").dead and E("cyclops").dead)
+table.insert(enemies, newEnemy("newspawn", 600, 30))
+for i = 1, 6 do frame() end                                         -- >= 0.5 s
+check("new spawn gets capped", E("newspawn").hp == 1)
+local setsBefore = E("orc").sets
+for i = 1, 10 do frame() end
+check("dead enemies not touched again", E("orc").sets == setsBefore and not E("orc").revived)
+-- boss heals / phase change -> recapped
+E("newspawn").hp = 5000
+for i = 1, 6 do frame() end
+check("healed/phase-2 enemy recapped", E("newspawn").hp == 1)
+-- period: not every frame
+local s0 = E("newspawn").sets; E("newspawn").hp = 100; frame(0.1); local s1 = E("newspawn").sets
+check("one-hit pass throttled (≈0.5s)", s1 - s0 <= 1)
+keys[0x77] = true; frame(); keys[0x77] = nil; frame(); drawUI()
+check("F8 disables one-hit", killStatus() == "状态：一击必杀：关闭", killStatus())
+E("newspawn").hp = 900; for i = 1, 10 do frame() end
+check("after off, HP no longer capped", E("newspawn").hp == 900)
+
+-- K4 UI checkbox for one-hit
+ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = true; drawUI(); frame(); drawUI()
+check("UI checkbox enables one-hit", E("newspawn").hp == 1, E("newspawn").hp)
+ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = false; drawUI(); frame()
+
+-- K5 no EnemyManager (title screen)
+enemyManagerPresent = false
+ui.clicks["秒杀全场（含 BOSS）"] = true; drawUI(); ui.clicks = {}
+local okK = pcall(frame); drawUI()
+check("no EnemyManager: no crash", okK)
+check("no EnemyManager: clear status", killStatus():find("EnemyManager") ~= nil, killStatus())
+enemyManagerPresent = true
+
+-- K6 diagnostics dump
+os.remove("DD2_HitMethods.txt")
+ui.clicks["诊断：导出 HP/伤害相关方法"] = true; drawUI(); ui.clicks = {}; drawUI()
+local df = io.open("DD2_HitMethods.txt"); local dump = df and df:read("a") or ""; if df then df:close() end
+check("dump file written", dump ~= "", killStatus())
+check("dump has setHpValue signature", dump:find("setHpValue%(System.Single, System.Boolean%)") ~= nil, dump)
+check("dump has damage(DamageInfo)", dump:find("damage%(app.HitController.DamageInfo%)") ~= nil)
+check("dump has Character death method", dump:find("onDie%(%)") ~= nil)
+check("dump filters unrelated (no warp/update)", not dump:find("warp") and not dump:find("update%("))
+
+-- K7 cross-feature: kill while flying
+enemies = { newEnemy("bandit", 400, 25) }
+fly(true)
+s = P.model; moveFrame({ 0x20 })
+keys[0x76] = true; frame(); keys[0x76] = nil; frame()
+check("kill works while flying", E("bandit").dead)
+s = P.model; moveFrame({ 0x20 })
+check("fly still works after kill", approx(P.model.y, s.y + 1.2))
+fly(false)
 
 -- ===================== Regression: item features =====================
 currentPlayer = newPlayer(0x7000); P = currentPlayer; frame()
