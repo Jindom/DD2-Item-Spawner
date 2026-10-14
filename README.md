@@ -127,8 +127,8 @@
 - 兜底：输入钩子 0.2 秒未触发时改在 `UpdateBehavior` 执行；`warp` 不可用时退回 `set_Position` 并在状态栏报警；单帧被外部移动 >30 m 视为游戏传送（如渡石），跟随而不拉回。
 
 **秒杀全场**
-- 敌人：`app.EnemyManager:getAllEnemies()`。Dark Arisen 版本的这个集合没有 `get_Item`，因此依次尝试 `get_elements` / `ToArray` / `_items` / `get_Item` / `_entries` 取元素，并在日志里记录成功的方式；元素可以是 `Character` 本身或带 `get_Chara()` 的包装。
-- 击杀：`Character.get_Hit()` 得到 `app.HitController`，调用 `setHpValue(System.Single, System.Boolean)` 把 HP 设为 0；0.5 秒后用 `Character.get_IsDead()` 确认，仍未死亡的调用 `Character.killAndSetDieLoop(app.Character.KillAndSetDieLoopOption)` 补刀。
+- 敌人：`app.EnemyManager:getAllEnemies()`，实测返回 `app.Ch200000[]` 托管数组，用 `get_size()` + `get_element(i)` 读取；同时兼容 `get_elements`（userdata 容器）/ `ToArray` / `_items` / `get_Item` / `_entries`，日志里记录成功的方式；元素用 `get_Chara()` 取 `Character`。
+- 击杀：`Character.get_Hit()` 得到 `app.HitController`，调用 `setHpValue(System.Single, System.Boolean)` 把 HP 设为 0；0.5 秒后用 `Character.get_IsDead()` 确认，仍未死亡的调用 `Character.killAndSetDieLoop(app.Character.KillAndSetDieLoopOption)` 补刀（实测 Option 是类，字段 `MotionBankID` / `MotionID`；先传 null 用默认死亡动作，失败再传新建实例）。
 - 剧情保护：`HitController.get_IsNoDie()` 为真时默认跳过；勾选强制后先 `set_IsNoDie(false)` / `set_IsAttackNoDie(false)`。
 - 已死亡（`get_IsDead()`）的敌人不处理；每个敌人单独 `pcall`，一个出错不影响其他敌人；同类错误日志只记一次。
 - 诊断在游戏线程执行：反射列出 `HitController` / `Character` 中 HP / 死亡 / 伤害相关方法、`EnemyManager` 全部方法、`KillAndSetDieLoopOption` 的取值，以及敌人列表详情。
@@ -140,10 +140,12 @@
 `tests/mock_test.lua` 用模拟的 REFramework API 和 DD2 角色行为离线测试脚本逻辑，不需要游戏：
 
 ```bash
-lua tests/mock_test.lua reframework/autorun/DD2_ItemSpawner.lua
+tests/run.sh [lua 可执行文件] [lua 头文件目录]   # 先编译 tests/native/mockud.c，再运行测试
 ```
 
-模拟器还原了 DD2 的位置历史（直接改 Transform 会被拉回）、动作阶段取模型位置、重力与摔伤、游戏自身的走路 / 跳跃输入，以及 Dark Arisen 的敌人集合（没有 `get_Item`，模拟 5 种集合形态）和两种死亡行为（HP 归零即死 / 需要击杀函数），含 BOSS、剧情不死保护、尸体、远处敌人、出错的敌人，共 120 项检查：
+`mockud` 用来产生真正的 userdata，模拟 REFramework 的 `get_elements()` 返回值（不是 Lua table）。
+
+模拟器还原了 DD2 的位置历史（直接改 Transform 会被拉回）、动作阶段取模型位置、重力与摔伤、游戏自身的走路 / 跳跃输入，以及 Dark Arisen 实测的敌人集合（`app.Ch200000[]` 托管数组，`get_elements()` 返回 userdata，没有 `get_Item` / `ToArray`；另测 5 种集合形态）和两种死亡行为（HP 归零即死 / 需要击杀函数，`KillAndSetDieLoopOption` 为类、null 可用 / 不可用），含 BOSS、剧情不死保护、尸体、远处敌人、出错的敌人，共 125 项检查：
 
 - **飞天**：模型跟随（v1.1.0 之前「只动镜头」的 bug 在此复现）、开关边沿触发、六方向移动与速度、Shift 加速、斜向归一化、镜头朝向、帧时间上限、悬停、传送跟随、碰撞组件保持关闭与恢复、游戏输入屏蔽与恢复、防摔伤开 / 关对比、菜单打开时不移动、`warp` / 输入钩子不可用时的兜底、玩家对象变化自动关闭、异常不崩溃。
 - **秒杀全场**：v1.2.0「识别不到敌人」的 bug 在此复现；5 种集合形态下秒杀含远处 BOSS、每个敌人只处理一次、尸体不被复活；HP 归零不死时击杀函数补刀；剧情不死保护默认跳过 / 强制击杀；单个敌人出错隔离且日志只记一次；范围过滤；F8 一击必杀（压血、任意一击致死、新刷怪、回血 / 换阶段重新压血、节流、关闭后停止、不碰剧情保护）；集合不可读时不刷屏日志；无 EnemyManager 时不崩溃；诊断内容；飞行中秒杀。
@@ -155,6 +157,8 @@ lua tests/mock_test.lua reframework/autorun/DD2_ItemSpawner.lua
 modinfo.ini                               Fluffy Mod Manager 元数据
 reframework/autorun/DD2_ItemSpawner.lua   脚本本体
 tests/mock_test.lua                       离线模拟测试
+tests/run.sh                              编译测试辅助并运行
+tests/native/mockud.c                     测试辅助：产生 userdata
 CHANGELOG.md                              更新日志
 ```
 

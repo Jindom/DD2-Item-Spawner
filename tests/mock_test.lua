@@ -122,8 +122,18 @@ local HP_SIG = "setHpValue(System.Single, System.Boolean)"
 local KILL_SIG = "killAndSetDieLoop(app.Character.KillAndSetDieLoopOption)"
 local enemies = {}
 local enemyManagerPresent = true
-local listShape = "ToArray"     -- ToArray | _items | _entries | get_elements | get_Item | none
+local listShape = "array"       -- array（实测：app.Ch200000[]）| ToArray | _items | _entries | get_elements | get_Item | none
+local killNullOk = true        -- killAndSetDieLoop(null) 是否有效
 local hp0Kills = true           -- true: HP 归零即死亡；false: 需要 killAndSetDieLoop
+-- REFramework 的 get_elements() 返回 sol 容器（userdata，不是 table）。
+-- tests/native/mockud.c 提供真正的 userdata；没编译时退回带元表的 table（会打印警告）。
+local okUD, mockud = pcall(require, "mockud")
+if not okUD then print("WARN  mockud not built: get_elements() returns a table, the userdata case is NOT covered") end
+local function solContainer(t)
+  local mt = { __len = function() return #t end, __index = function(_, i) return t[i] end }
+  if okUD then return mockud.new(mt) end
+  return setmetatable({}, mt)
+end
 local function arrayOf(t)
   return { get_elements = function() local c = {} for i, v in ipairs(t) do c[i] = v end return c end }
 end
@@ -159,7 +169,8 @@ local function newEnemy(name, hp, dist, opts)
     call = function(self, sig, ...)
       if sig == KILL_SIG then
         local opt = ...
-        assert(opt ~= nil, "option missing")
+        if opt == nil and not killNullOk then error("NullReferenceException") end
+        if opt ~= nil then assert(opt.isKillOpt, "wrong option object") end
         if e.broken then error("broken") end
         if e.noDie then return end            -- 剧情保护时游戏函数也杀不死
         e.kills = e.kills + 1; e.hp = 0; e.dead = true
@@ -201,6 +212,13 @@ local function enemyList()
     end,
   }
   if listShape == "ToArray" then col.ToArray = function() return arrayOf(objs) end end
+  if listShape == "array" then
+    col.get_type_definition = function() return { get_full_name = function() return "app.Ch200000[]" end } end
+    col.get_size = function() return #objs end
+    col.get_element = function(self, i) return objs[i + 1] end
+    col.get_elements = function() return solContainer(objs) end
+    col.call = function(self, sig) return nil end            -- get_Item: "empty"
+  end
   if listShape == "get_elements" then col.get_elements = function() local c = {} for i, v in ipairs(objs) do c[i] = v end return c end end
   return col
 end
@@ -227,12 +245,12 @@ local function typeDef(n)
     end,
   }
 end
-local killOptType = {
-  get_parent_type = function() return { get_full_name = function() return "System.Enum" end } end,
-  is_value_type = function() return true end,
+local killOptType = {   -- 实测：class，字段 MotionBankID / MotionID
+  get_parent_type = function() return { get_full_name = function() return "System.Object" end } end,
+  is_value_type = function() return false end,
   get_fields = function() return {
-    { get_name = function() return "None" end, is_static = function() return true end, get_data = function() return 0 end },
-    { get_name = function() return "NoDrop" end, is_static = function() return true end, get_data = function() return 1 end } } end,
+    { get_name = function() return "MotionBankID" end, is_static = function() return false end },
+    { get_name = function() return "MotionID" end, is_static = function() return false end } } end,
 }
 sdk = {
   find_type_definition = function(n)
@@ -259,6 +277,10 @@ sdk = {
   end,
   get_primary_camera = function() return { get_GameObject = function() return { get_Transform = function() return { get_WorldMatrix = function() return camMatrix() end } end } end } end,
   typeof = function(n) return n end,
+  create_instance = function(n)
+    assert(n == "app.Character.KillAndSetDieLoopOption", n)
+    local o = { isKillOpt = true }; o.add_ref = function() return o end; return o
+  end,
   hook = function(m, pre, post) table.insert(hooks, { m = m, pre = pre, post = post }) end,
   to_managed_object = function(x) return x end,
 }
@@ -517,7 +539,7 @@ check("unreadable list: no crash + clear status", killStatus():find("敌人列�
 check("unreadable list: failure logged once", countLog("unreadable") == 1, countLog("unreadable"))
 
 -- K1 every collection shape works (Dark Arisen list has no get_Item)
-for _, shape in ipairs({ "ToArray", "_items", "_entries", "get_elements", "get_Item" }) do
+for _, shape in ipairs({ "array", "ToArray", "_items", "_entries", "get_elements", "get_Item" }) do
   listShape = shape
   enemies = { newEnemy("goblin", 300, 10), newEnemy("dragon", 90000, 900, { boss = true }), newEnemy("corpse", 0, 5) }
   pressF7(); settle()
@@ -526,7 +548,7 @@ for _, shape in ipairs({ "ToArray", "_items", "_entries", "get_elements", "get_I
   check("[" .. shape .. "] each enemy processed once", E("goblin").sets == 1 and E("dragon").sets == 1, E("goblin").sets)
   check("[" .. shape .. "] corpse untouched", E("corpse").sets == 0 and not E("corpse").revived)
 end
-listShape = "ToArray"
+listShape = "array"
 
 -- K2 HP 0 doesn't kill → killAndSetDieLoop finishes them after confirm delay
 hp0Kills = false
@@ -538,6 +560,12 @@ settle()
 check("hp0-alive: ogre finished by killAndSetDieLoop", E("ogre").dead and E("ogre").kills == 1)
 check("hp0-alive: boss finished by killAndSetDieLoop", E("griffin").dead and E("griffin").kills == 1)
 check("hp0-alive: status reports forced kills", killStatus():find("2 个用游戏击杀函数补刀") ~= nil, killStatus())
+-- killAndSetDieLoop(null) throws → falls back to a KillAndSetDieLoopOption instance
+killNullOk = false
+enemies = { newEnemy("troll", 7000, 20) }
+pressF7(); settle()
+check("null option fails → instance option kills", E("troll").dead and E("troll").kills == 1, killStatus())
+killNullOk = true
 hp0Kills = true
 enemies = { newEnemy("rat", 50, 5) }
 pressF7(); settle()
@@ -611,7 +639,7 @@ ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = true; drawU
 for i = 1, 60 do frame() end
 check("one-hit unreadable list logged once (no spam)", countLog("unreadable") <= 1, countLog("unreadable"))
 ui.checkbox["一击必杀模式（持续把敌人 HP 压到 1）"] = false; drawUI(); frame()
-listShape = "ToArray"
+listShape = "array"
 
 -- K9 no EnemyManager (title screen)
 enemyManagerPresent = false
@@ -632,8 +660,8 @@ check("diag file written", dump ~= "", killStatus())
 check("diag: HitController methods", dump:find("setHpValue%(System.Single, System.Boolean%)") ~= nil)
 check("diag: killAndSetDieLoop listed", dump:find("killAndSetDieLoop%(app.Character.KillAndSetDieLoopOption%)") ~= nil)
 check("diag: EnemyManager methods (unfiltered)", dump:find("getAllEnemies%(%)") ~= nil and dump:find("get_EnemyCount") ~= nil)
-check("diag: kill option enum fields", dump:find("None = 0") ~= nil and dump:find("parent=System.Enum") ~= nil, dump)
-check("diag: list type + count + via", dump:find("count=2") and dump:find("via=ToArray"), dump)
+check("diag: kill option class fields", dump:find("MotionBankID") ~= nil and dump:find("parent=System.Object") ~= nil, dump)
+check("diag: list type + count + via", dump:find("type=app.Ch200000%[%]") and dump:find("count=2") and dump:find("via=get_element"), dump)
 check("diag: per-enemy line with id/HP/NoDie", dump:find("CharaIDString=medusa") and dump:find("IsNoDie=true") and dump:find("Hp=40000"), dump)
 check("diag: filters unrelated Character methods", not dump:find("warp%("))
 

@@ -519,18 +519,31 @@ local function typeName(obj)
     return ok and n or "?"
 end
 
+-- 把 REFramework 返回的容器（Lua table 或 sol 容器 userdata）转成 Lua 数组
+local function toList(t, limit)
+    assert(t ~= nil)
+    local n = #t
+    if limit and limit < n then n = limit end
+    local out = {}
+    for i = 1, n do out[#out + 1] = t[i] end
+    return out
+end
+
 -- 取集合里的元素：返回 Lua 数组 + 使用的方式
+-- 实测 Dark Arisen：getAllEnemies() 返回 app.Ch200000[]（托管数组），
+-- get_elements() 返回的是 sol 容器而不是 table，get_Item 不存在。
 local function iterItems(col, count)
     local tries = {
-        { "get_elements", function()
-            local t = col:get_elements(); assert(type(t) == "table"); return t end },
-        { "ToArray", function()
-            local t = col:ToArray():get_elements(); assert(type(t) == "table"); return t end },
+        { "get_element", function()
+            local n = col:get_size()
+            local t = {}
+            for i = 0, n - 1 do t[#t + 1] = col:get_element(i) end
+            return t end },
+        { "get_elements", function() return toList(col:get_elements()) end },
+        { "ToArray", function() return toList(col:ToArray():get_elements()) end },
         { "_items", function()
             local arr = col:get_field("_items"); assert(arr)
-            local t, all = {}, arr:get_elements()
-            for i = 1, math.min(count, #all) do t[i] = all[i] end
-            return t end },
+            return toList(arr:get_elements(), count) end },
         { "get_Item", function()
             local t = {}
             for i = 0, count - 1 do t[#t + 1] = col:call("get_Item", i) end
@@ -538,7 +551,7 @@ local function iterItems(col, count)
         { "_entries", function()
             local arr = col:get_field("_entries") or col:get_field("_slots"); assert(arr)
             local t = {}
-            for _, en in ipairs(arr:get_elements()) do
+            for _, en in ipairs(toList(arr:get_elements())) do
                 local v = en:get_field("Value") or en:get_field("value") or en:get_field("Key")
                 if v then t[#t + 1] = v end
             end
@@ -568,7 +581,10 @@ local function enemyList()
     local ok, col = pcall(function() return em:getAllEnemies() end)
     if not ok or not col then return nil, "getAllEnemies 失败：" .. tostring(col) end
     local okC, n = pcall(function() return col:get_Count() end)
-    if not okC then n = 0 end
+    if not okC or type(n) ~= "number" then
+        local okS, sz = pcall(function() return col:get_size() end)
+        n = okS and sz or 0
+    end
     local items, via = iterItems(col, n or 0)
     if not items then
         logOnce("enum:" .. via, "enemy list " .. typeName(col) .. " count=" .. tostring(n) .. " unreadable: " .. via)
@@ -619,28 +635,33 @@ local function forEachEnemy(fn)
     return seen, nil, errs
 end
 
-local killOptCache
-local function killOpt()
-    if killOptCache ~= nil then return killOptCache end
-    killOptCache = false
+-- 实测：KillAndSetDieLoopOption 是类（字段 MotionBankID / MotionID），不是枚举。
+-- 先传 null 让游戏用默认死亡动作，失败再传新建的实例。
+local killOptInst
+local function killOptInstance()
+    if killOptInst ~= nil then return killOptInst end
+    killOptInst = false
     pcall(function()
         local td = sdk.find_type_definition("app.Character.KillAndSetDieLoopOption")
         local parent = td:get_parent_type()
         if parent and parent:get_full_name() == "System.Enum" then
-            killOptCache = 0
+            killOptInst = 0
         elseif td:is_value_type() then
-            killOptCache = ValueType.new(td)
+            killOptInst = ValueType.new(td)
         else
-            killOptCache = sdk.create_instance("app.Character.KillAndSetDieLoopOption"):add_ref()
+            killOptInst = sdk.create_instance("app.Character.KillAndSetDieLoopOption"):add_ref()
         end
     end)
-    return killOptCache
+    return killOptInst
 end
 
 local function forceKill(chara)
-    local opt = killOpt()
-    if opt == false then error("KillAndSetDieLoopOption 不可用") end
-    chara:call(KILL_SIG, opt)
+    local ok, e = pcall(function() chara:call(KILL_SIG, nil) end)
+    if ok and isDead(chara) then return "null" end
+    local inst = killOptInstance()
+    if inst == false then error("killAndSetDieLoop(null) 未生效且无法创建 KillAndSetDieLoopOption：" .. tostring(e)) end
+    chara:call(KILL_SIG, inst)
+    return "instance"
 end
 
 local function killAll()
@@ -679,7 +700,10 @@ local function confirmKills()
             dead = dead + 1
         else
             local ok, e = pcall(forceKill, chara)
-            if ok then forced = forced + 1 else
+            if ok then
+                forced = forced + 1
+                logOnce("forcevia:" .. tostring(e), "killAndSetDieLoop option=" .. tostring(e))
+            else
                 failed = failed + 1
                 logOnce("forcekill:" .. tostring(e), "killAndSetDieLoop failed: " .. tostring(e))
             end
